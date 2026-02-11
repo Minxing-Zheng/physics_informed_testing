@@ -114,7 +114,7 @@ def plot_mu_safety_map(
 
     if mode == "prob":
         Z = res.get("p_safe_grid", res.get("safe"))
-        cbar_label = r"$\hat p_{\mathrm{safe}}(\mu)$"
+        cbar_label = "Safety Probability (Chance)"#r"$\hat p_{\mathrm{safe}}(\mu)$"
         threshold_value = 1.0 - float(eta)
     elif mode == "indicator":
         Z = res.get("config_safe_grid")
@@ -124,7 +124,7 @@ def plot_mu_safety_map(
             if safe_grid is None:
                 raise ValueError("Need 'safe' grid to derive indicator map.")
             Z = (np.asarray(safe_grid) >= thr).astype(float)
-        cbar_label = r"$\mathbb{1}\{\hat p_{\mathrm{safe}}(\mu)\geq 1-\eta\}$"
+        cbar_label ="Safety Indicator" #r"$\mathbb{1}\{\hat p_{\mathrm{safe}}(\mu)\geq 1-\eta\}$"
     else:
         raise ValueError("mode must be 'indicator' or 'prob'")
 
