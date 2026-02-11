@@ -1,1 +1,0 @@
-# physics_informed_testing

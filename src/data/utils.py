@@ -1,5 +1,13 @@
 """
-Small plotting helpers for trajectory visualization.
+Utility and visualization helpers for sampling and safety evaluation.
+
+Only a small subset is used by the notebooks:
+- plot_traj, check_safety, plot_x_safety_map
+- plot_mu_safety_map, compute_mu_safety_map
+- filter_to_box, (alias of sample_x for backward compatibility)
+
+The original file was removed inadvertently; this reconstruction keeps the
+API stable for the existing notebooks.
 """
 
 from __future__ import annotations
@@ -9,11 +17,51 @@ from typing import Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
+from joblib import Parallel, delayed
+
+from data.solve_ode import simulate_spring
+from data.sample_x import sample_x, _filter_to_box as filter_to_box
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
 
 
 def _ensure_dir(path: str) -> None:
     if path and not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
+
+
+def sample_gaussian_and_filter(
+    n: int,
+    mean: np.ndarray,
+    cov: np.ndarray,
+    rng: np.random.Generator | None = None,
+    truncate_box: tuple[float, float] | None = None,
+    max_rounds: int = 50,
+    oversample: int = 2,
+) -> np.ndarray:
+    """
+    Backward-compatible wrapper that routes to sample_x with truncation support.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    seed = int(rng.integers(0, 2**32 - 1))
+    return sample_x(
+        n_samples=n,
+        dist_type="gaussian",
+        params={"mean": mean, "cov": cov},
+        seed=seed,
+        truncate_box=truncate_box,
+        oversample=oversample,
+        max_rounds=max_rounds,
+    )
+
+
+
+# --------------------------------------------------------------------------- #
+# Trajectory utilities
+# --------------------------------------------------------------------------- #
 
 
 def plot_traj(
@@ -27,21 +75,6 @@ def plot_traj(
 ) -> None:
     """
     Plot trajectories from simulate_spring output.
-
-    Parameters
-    ----------
-    traj : dict
-        Output from simulate_spring with keys "t", "s", "s_dot".
-    title : str
-        Plot title.
-    threshold : float, optional
-        If provided, draw horizontal bounds at +/- threshold.
-    window : tuple, optional
-        If provided, shade a time window (t1, t2).
-    n_max : int, optional
-        Max number of trajectories to draw if s is 2D. None draws all.
-    save_path : str, optional
-        If provided, save figure to this path.
     """
     tau = threshold
     t = traj.get("t")
@@ -71,12 +104,12 @@ def plot_traj(
 
     if tau is not None:
         tau = float(tau)
-        plt.axhline(+tau, linestyle="--", linewidth=2, label="Safety Threshold", color='red')
-        plt.axhline(-tau, linestyle="--", linewidth=2, color='red')
+        plt.axhline(+tau, linestyle="--", linewidth=2, label="Safety Threshold", color="red")
+        plt.axhline(-tau, linestyle="--", linewidth=2, color="red")
 
     if window is not None:
         t1, t2 = float(window[0]), float(window[1])
-        plt.axvspan(t1, t2, alpha=0.2, label="Inspect Window", color='tab:orange')
+        plt.axvspan(t1, t2, alpha=0.2, label="Inspect Window", color="tab:orange")
     if ylim is not None:
         y0, y1 = float(ylim[0]), float(ylim[1])
         if y0 >= y1:
@@ -86,7 +119,6 @@ def plot_traj(
     plt.title(title)
     plt.xlabel("Time")
     plt.ylabel("State s(t)")
-    
     plt.legend()
     plt.grid(True)
 
@@ -102,44 +134,34 @@ def check_safety(
     window: Tuple[float, float],
 ) -> np.ndarray | bool:
     """
-    Check safety for each trajectory based on max value in a time window.
-
-    Parameters
-    ----------
-    traj : dict
-        Output from simulate_spring with keys "t" and "s".
-    threshold : float
-        Safety threshold; violation if max(s) in window exceeds this value.
-    window : tuple
-        Time window (t1, t2) to check.
+    Check safety for each trajectory based on max |s| inside a time window.
+    Returns a boolean mask (one per trajectory) or a single bool for 1D s.
     """
     t = traj.get("t")
     s = traj.get("s")
     if t is None or s is None:
         raise ValueError("traj must contain keys 't' and 's'")
 
-    t = np.asarray(t, dtype=float)
-    s = np.asarray(s, dtype=float)
+    t = np.asarray(t)
+    s = np.asarray(s)
     t1, t2 = float(window[0]), float(window[1])
-    if t1 >= t2:
-        raise ValueError("window must satisfy t1 < t2")
-
-    mask = (t >= t1) & (t <= t2)
-    if not np.any(mask):
-        raise ValueError("window does not overlap the time grid")
-
+    mask_t = (t >= t1) & (t <= t2)
     if s.ndim == 1:
-        max_val = np.max(s[mask])
-        return bool(max_val <= threshold)
-
-    if s.ndim == 2:
-        max_vals = np.max(s[:, mask], axis=1)
-        return max_vals <= threshold
-
-    raise ValueError("traj['s'] must be 1D or 2D")
+        safe = np.max(np.abs(s[mask_t])) <= threshold
+    elif s.ndim == 2:
+        safe = np.max(np.abs(s[:, mask_t]), axis=1) <= threshold
+    else:
+        raise ValueError("traj['s'] must be 1D or 2D")
+    return safe
 
 
-def plot_x_safety_map(
+# --------------------------------------------------------------------------- #
+# Sampling and safety maps
+# --------------------------------------------------------------------------- #
+
+
+
+def compute_x_safety_map(
     params,
     t_final: float,
     dt: float,
@@ -151,19 +173,9 @@ def plot_x_safety_map(
     config: np.ndarray | None = None,
     x0: float = 0.0,
     v0: float = 0.0,
-    title: str = "Safety map in X box",
-    cmap: str = "RdYlGn",
-    mean: Optional[np.ndarray] = None,
-    cov: Optional[np.ndarray] = None,
-    contour_levels: int = 6,
-    contour_color: str = "k",
-    contour_alpha: float = 0.8,
-    eta: float = 0.1,
-    print_msg: bool = True,
-    save_path: Optional[str] = None,
 ) -> dict[str, np.ndarray]:
     """
-    Sample X uniformly in a box, simulate s(t), check safety, and plot a color map.
+    Sample X uniformly in a box, simulate s(t), and return safety grid (no plotting).
 
     Parameters
     ----------
@@ -187,25 +199,6 @@ def plot_x_safety_map(
         Initial state; shape (2,) or (N, 2).
     x0, v0 : float
         Initial conditions if config is None.
-    title : str
-        Plot title.
-    cmap : str
-        Matplotlib colormap.
-    mean, cov : np.ndarray, optional
-        If provided, overlay Gaussian contour plot for X ~ N(mean, cov) and
-        estimate safety probability under the Gaussian.
-    contour_levels : int
-        Number of contour levels for the Gaussian overlay.
-    contour_color : str
-        Color for contour lines.
-    contour_alpha : float
-        Alpha for contour lines.
-    eta : float
-        Chance-constraint parameter. Safety means P(safe) >= 1 - eta.
-    print_msg : bool
-        If True, print the safety decision message when mean/cov are provided.
-    save_path : str, optional
-        If provided, save figure to this path.
     """
     from data.solve_ode import simulate_spring
     tau = threshold
@@ -241,60 +234,262 @@ def plot_x_safety_map(
     safe_mask = check_safety(traj, threshold=tau, window=window)
     safe_grid = np.asarray(safe_mask, dtype=float).reshape(W_grid.shape)
 
-    plt.figure()
-    plt.pcolormesh(a_vals, w_vals, safe_grid, cmap=cmap, shading="auto", vmin=0.0, vmax=1.0)
-    plt.colorbar(label="safe (1) / unsafe (0)")
-    p_safe = None
-    threshold_value = None
-    config_safe = None
-    if mean is not None and cov is not None:
-        mu = np.asarray(mean, dtype=float).reshape(2)
-        sigma = np.asarray(cov, dtype=float).reshape(2, 2)
-        inv = np.linalg.inv(sigma)
-        det = np.linalg.det(sigma)
-        if det <= 0:
-            raise ValueError("cov determinant must be > 0 for contour plotting")
-        grid = np.stack([A_grid.ravel(), W_grid.ravel()], axis=1)
-        diff = grid - mu.reshape(1, 2)
-        quad = np.einsum("bi,ij,bj->b", diff, inv, diff)
-        Z = np.exp(-0.5 * quad) / (2 * np.pi * np.sqrt(det))
-        Z = Z.reshape(A_grid.shape)
-        plt.contour(
-            A_grid,
-            W_grid,
-            Z,
-            levels=contour_levels,
-            colors=contour_color,
-            linewidths=1.0,
-            alpha=contour_alpha,
-        )
-        if not (0.0 <= eta < 1.0):
-            raise ValueError("eta must be in [0, 1)")
-        p_safe = float(np.sum(safe_grid * Z) / np.sum(Z))
+    return {
+        "A": a_vals,
+        "omega": w_vals,
+        "mu1": a_vals,
+        "mu2": w_vals,
+        "safe": safe_grid,
+        "t": traj.get("t"),
+        "s": traj.get("s"),
+    }
+    
+
+
+def _bin_edges(vals: np.ndarray) -> np.ndarray:
+    """Convert 1D grid centers to bin edges for pcolormesh."""
+    vals = np.asarray(vals, float)
+    if vals.size < 2:
+        raise ValueError("Need at least 2 grid points to form bin edges.")
+    mid = 0.5 * (vals[1:] + vals[:-1])
+    edges = np.empty(vals.size + 1, dtype=float)
+    edges[1:-1] = mid
+    edges[0] = vals[0] - (mid[0] - vals[0])
+    edges[-1] = vals[-1] + (vals[-1] - mid[-1])
+    return edges
+
+
+def plot_mu_safety_map(
+    res: dict,
+    *,
+    mode: str = "indicator",  # "indicator" or "prob"
+    title: str = r"Safety map over $\mu$",
+    cmap: str = "RdYlGn",
+    eta=0.1,
+    show_cell_edges: bool = True,
+    edgecolor: str = "k",
+    linewidth: float = 0.2,
+    draw_boundary: bool = True,
+    boundary_color: str = "k",
+    boundary_lw: float = 1.0,
+    boundary_alpha: float = 0.9,
+    colorbar: bool = True,
+    save_path: Optional[str] = None,
+    vmin=0, vmax = 1
+) -> None:
+    """
+    Plot a precomputed mu safety map. Keeps plotting separate from computation.
+    """
+    mu1_vals = res["mu1"] if "mu1" in res else res.get("A")
+    mu2_vals = res["mu2"] if "mu2" in res else res.get("omega")
+    if mu1_vals is None or mu2_vals is None:
+        raise ValueError("res must contain mu1/mu2 (or A/omega) grid coordinates.")
+
+    if mode == "prob":
+        Z = res.get("p_safe_grid", res.get("safe"))
+        cbar_label = r"$\hat p_{\mathrm{safe}}(\mu)$"
         threshold_value = 1.0 - float(eta)
-        config_safe = 1 if p_safe >= threshold_value else 0
-        if print_msg:
-            status = "SAFE" if config_safe == 1 else "UNSAFE"
-            print(
-                f"Empirical safety probability={p_safe:.4f} vs threshold {threshold_value:.4f} "
-                f"(eta={eta:.4f}) -> {status}"
-            )
+    elif mode == "indicator":
+        Z = res.get("config_safe_grid")
+        if Z is None:
+            safe_grid = res.get("safe")
+            thr = res.get("threshold", 1.0)
+            if safe_grid is None:
+                raise ValueError("Need 'safe' grid to derive indicator map.")
+            Z = (np.asarray(safe_grid) >= thr).astype(float)
+        cbar_label = r"$\mathbb{1}\{\hat p_{\mathrm{safe}}(\mu)\geq 1-\eta\}$"
+    else:
+        raise ValueError("mode must be 'indicator' or 'prob'")
+
+    Z = np.asarray(Z)
+    mu1_vals = np.asarray(mu1_vals)
+    mu2_vals = np.asarray(mu2_vals)
+
+    # Align axes: pcolormesh expects (Ny, Nx) = (len(mu2), len(mu1))
+    if Z.shape == (mu1_vals.size, mu2_vals.size):
+        Z_plot = Z.T
+    elif Z.shape == (mu2_vals.size, mu1_vals.size):
+        Z_plot = Z
+    else:
+        raise ValueError(f"Shape mismatch: Z{Z.shape} vs grid ({mu1_vals.size}, {mu2_vals.size})")
+
+    mu1_edges = _bin_edges(mu1_vals)
+    mu2_edges = _bin_edges(mu2_vals)
+
+    plt.figure()
+    mesh_kwargs = dict(cmap=cmap, shading="auto", vmin=vmin, vmax=vmax)
+    if show_cell_edges:
+        mesh_kwargs.update(edgecolors=edgecolor, linewidth=linewidth)
+
+    plt.pcolormesh(mu1_edges, mu2_edges, Z_plot, **mesh_kwargs)
+
+    if colorbar:
+        plt.colorbar(label=cbar_label)
+
+    if draw_boundary:
+        if mode == "indicator":
+            Zc = res.get("config_safe_grid", res.get("config_safe"))
+            if Zc is not None:
+                Zc = np.asarray(Zc)
+                if Zc.shape == (mu1_vals.size, mu2_vals.size):
+                    Zc = Zc.T
+                plt.contour(mu1_vals, mu2_vals, Zc, levels=[0.5],
+                            colors=boundary_color, linewidths=boundary_lw, alpha=boundary_alpha)
+        elif mode == "prob":
+            plt.contour(mu1_vals, mu2_vals, Z_plot, levels=[threshold_value],
+                        colors=boundary_color, linewidths=boundary_lw,
+                        alpha=boundary_alpha, linestyles="--")
+
     plt.title(title)
-    plt.xlabel("A")
-    plt.ylabel("omega")
+    plt.xlabel(r"$\mu_1$")
+    plt.ylabel(r"$\mu_2$")
     plt.grid(False)
 
     if save_path:
         _ensure_dir(os.path.dirname(save_path))
         plt.savefig(save_path, dpi=200, bbox_inches="tight")
+
     plt.show()
 
+
+def _eval_one_mu_cell(
+    j: int,
+    i: int,
+    mu: np.ndarray,
+    *,
+    params,
+    t_final: float,
+    dt: float,
+    window: Tuple[float, float],
+    tau: float,
+    sigma: np.ndarray,
+    n_per_mu: int,
+    forcing_type: str,
+    config: np.ndarray | None,
+    truncate_X_box: Optional[tuple[float, float]],
+    batch_size: int,
+    seed: int,
+) -> tuple[int, int, float]:
+    """
+    Evaluate p_safe(mu) for one grid cell (j, i). Returns (j, i, p_safe).
+    Each cell uses its own RNG seed for reproducibility.
+    """
+    rng = np.random.default_rng(seed)
+    X = sample_x(
+        n_samples=n_per_mu,
+        dist_type="gaussian",
+        params={"mean": mu, "cov": sigma},
+        seed=seed,
+        truncate_box=truncate_X_box,
+    )
+
+    safe_count = 0
+    n_done = 0
+    while n_done < n_per_mu:
+        Xb = X[n_done : n_done + batch_size]
+        traj = simulate_spring(
+            params=params,
+            t_final=t_final,
+            dt=dt,
+            X=Xb,
+            forcing_type=forcing_type,
+            config=config,
+        )
+        safe_mask = check_safety(traj, threshold=tau, window=window)
+        safe_count += int(np.sum(safe_mask))
+        n_done += Xb.shape[0]
+
+    return j, i, safe_count / float(n_per_mu)
+
+
+def compute_mu_safety_map(
+    params,
+    t_final: float,
+    dt: float,
+    window: Tuple[float, float],
+    threshold: float,
+    cov: np.ndarray,
+    n_mu_grid: int = 25,
+    mu_limits: tuple[float, float] | tuple[tuple[float, float], tuple[float, float]] = (-1.0, 1.0),
+    n_per_mu: int = 10_000,
+    forcing_type: str = "sin",
+    config: np.ndarray | None = None,
+    eta: float = 0.1,
+    truncate_X_box: Optional[tuple[float, float]] = None,
+    batch_size: int = 2000,
+    seed: int = 0,
+    n_jobs: int = -1,
+) -> dict:
+    """
+    Estimate p_safe(mu) on a grid of initial-condition means.
+    """
+    cov = np.asarray(cov, float)
+    if isinstance(mu_limits[0], (tuple, list, np.ndarray)):
+        A_lim, w_lim = mu_limits  # type: ignore
+    else:
+        A_lim = w_lim = mu_limits  # symmetric box
+    A_vals = np.linspace(A_lim[0], A_lim[1], n_mu_grid)
+    w_vals = np.linspace(w_lim[0], w_lim[1], n_mu_grid)
+    safe_grid = np.zeros((n_mu_grid, n_mu_grid), dtype=float)
+
+    seeds = np.random.SeedSequence(seed).spawn(n_mu_grid * n_mu_grid)
+    tasks = []
+    idx = 0
+    for j, A in enumerate(A_vals):
+        for i, w in enumerate(w_vals):
+            mu = np.array([A, w], dtype=float)
+            tasks.append((j, i, mu, seeds[idx]))
+            idx += 1
+
+    def _run(task):
+        j, i, mu, ss = task
+        return _eval_one_mu_cell(
+            j=j,
+            i=i,
+            mu=mu,
+            params=params,
+            t_final=t_final,
+            dt=dt,
+            window=window,
+            tau=threshold,
+            sigma=cov,
+            n_per_mu=n_per_mu,
+            forcing_type=forcing_type,
+            config=config,
+            truncate_X_box=truncate_X_box,
+            batch_size=batch_size,
+            seed=ss.generate_state(1)[0],
+        )
+
+    results = Parallel(n_jobs=n_jobs)(delayed(_run)(task) for task in tasks)
+    for j, i, p_safe in results:
+        safe_grid[j, i] = p_safe
+
+    # Basic safety decision on nominal config
+    if not (0.0 <= eta < 1.0):
+        raise ValueError("eta must be in [0, 1)")
+    threshold_value = 1.0 - float(eta)
+    config_safe_grid = (safe_grid >= threshold_value).astype(float)
+    config_safe = 1 if float(np.mean(safe_grid)) >= threshold_value else 0
+
     return {
-        "A": a_vals,
+        "A": A_vals,
         "omega": w_vals,
+        "mu1": A_vals,
+        "mu2": w_vals,
         "safe": safe_grid,
-        "p_safe": p_safe,
-        "threshold": threshold_value,
+        "config_safe_grid": config_safe_grid,
         "config_safe": config_safe,
+        "threshold": threshold_value,
     }
-    
+
+
+__all__ = [
+    "plot_traj",
+    "check_safety",
+    "compute_x_safety_map",
+    "filter_to_box",
+    "sample_gaussian_and_filter",
+    "compute_mu_safety_map",
+    "plot_mu_safety_map",
+]

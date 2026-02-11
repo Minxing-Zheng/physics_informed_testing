@@ -66,9 +66,26 @@ def sample_bivariate_gaussian(
     mean: Iterable[float] | np.ndarray = (0.0, 0.0),
     cov: Iterable[Iterable[float]] | np.ndarray = ((1.0, 0.0), (0.0, 1.0)),
     seed: int | None = None,
+    truncate_box: tuple[float, float] | None = None,
+    oversample: int = 2,
+    max_rounds: int = 50,
 ) -> np.ndarray:
     """Backward-compatible helper for 2D Gaussian draws."""
-    return sample_x(n_samples, dist_type="gaussian", params={"mean": mean, "cov": cov}, seed=seed)
+    return sample_x(
+        n_samples,
+        dist_type="gaussian",
+        params={"mean": mean, "cov": cov},
+        seed=seed,
+        truncate_box=truncate_box,
+        oversample=oversample,
+        max_rounds=max_rounds,
+    )
+
+
+def _filter_to_box(X: np.ndarray, low: float, high: float) -> np.ndarray:
+    """Keep rows within [low, high]^d."""
+    mask = np.all((X >= low) & (X <= high), axis=1)
+    return X[mask]
 
 
 def sample_x(
@@ -76,6 +93,9 @@ def sample_x(
     dist_type: str = "gaussian",
     params: dict | None = None,
     seed: int | None = None,
+    truncate_box: tuple[float, float] | None = None,
+    oversample: int = 2,
+    max_rounds: int = 50,
 ) -> np.ndarray:
     """
     Generic sampler for input X.
@@ -99,9 +119,31 @@ def sample_x(
         mean = np.asarray(params["mean"], dtype=float)
         cov = np.asarray(params["cov"], dtype=float)
         _validate_gaussian_params(mean, cov)
-        return rng.multivariate_normal(mean=mean, cov=cov, size=n_samples)
+        if truncate_box is None:
+            return rng.multivariate_normal(mean=mean, cov=cov, size=n_samples)
+
+        low, high = truncate_box
+        kept = []
+        total = 0
+        for _ in range(max_rounds):
+            X = rng.multivariate_normal(mean=mean, cov=cov, size=n_samples * oversample)
+            X = _filter_to_box(X, low, high)
+            if X.size > 0:
+                kept.append(X)
+                total += X.shape[0]
+            if total >= n_samples:
+                return np.concatenate(kept, axis=0)[:n_samples]
+
+        raise RuntimeError(
+            f"Not enough accepted samples inside box {truncate_box}. "
+            f"Try enlarging the box or increasing oversample/max_rounds."
+        )
 
     raise ValueError(f"Unsupported dist_type '{dist_type}'. Supported: gaussian.")
 
 
-__all__ = ["GaussianSpec", "sample_bivariate_gaussian", "sample_x"]
+__all__ = [
+    "GaussianSpec",
+    "sample_bivariate_gaussian",
+    "sample_x",
+]
