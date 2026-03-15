@@ -1,0 +1,27 @@
+
+for lambda_mmd in 3e-3 7e-3 9e-3; do
+  for seed in {1..5}; do
+    python3 model_diagnostics.py --lambda-mmd "$lambda_mmd" --seed "$seed"
+  done
+done
+
+
+for lr in 1e-4 5e-4 1e-3 5e-3 1e-2 5e-2; do   
+  for seed in {1..10}; do     
+    python3 model_diagnostics.py --lr "$lr" --seed "$seed";   
+  done; 
+done
+
+
+
+# stability_asymmetric_recon, bce
+#### seed 21-25, size = 10000
+#### seed 31-35, tau = 0.8, with _tau_ in file names
+#### 16..20 cov shift, has deltas = np.linspace(0, 0.8, 21) for 1,2 setting, and 0,1 for 3 setting
+  for seed in {21..30}; do     
+    python3 run.py --seed "$seed" --loss_type "stability_asymmetric_recon" --n-samples 10000 --perturb_type cov;
+  done; 
+
+for seed in {31..35}; do     
+    python3 model_diagnostics.py --seed "$seed" --loss_type "bce" --tau 0.8;
+done; 

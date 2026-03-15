@@ -7,7 +7,7 @@ from __future__ import annotations
 import torch
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def encode_to_latent(model, x_test, device, batch_size: int = 1024):
     """
     Works for:
@@ -19,7 +19,7 @@ def encode_to_latent(model, x_test, device, batch_size: int = 1024):
     if not torch.is_tensor(x_test):
         x_test = torch.tensor(x_test, dtype=torch.float32)
 
-    x_test = x_test.to(device)
+    x_test = x_test.to(device, non_blocking=(device.type == "cuda"))
     n = x_test.shape[0]
     vs = []
 

@@ -18,18 +18,36 @@ class SpringDataset(Dataset):
     x:      (N, d_x)
     o_hist: (N, L, d_o)
     o_next: (N, L, d_o)
+    y:      (N,) optional binary stability/safety label
     """
 
-    def __init__(self, x: np.ndarray, o_hist: np.ndarray, o_next: np.ndarray) -> None:
+    def __init__(
+        self,
+        x: np.ndarray,
+        o_hist: np.ndarray,
+        o_next: np.ndarray,
+        y: Optional[np.ndarray] = None,
+    ) -> None:
         self.x = torch.as_tensor(x, dtype=torch.float32)
         self.o_hist = torch.as_tensor(o_hist, dtype=torch.float32)
         self.o_next = torch.as_tensor(o_next, dtype=torch.float32)
+        self.y = None if y is None else torch.as_tensor(y, dtype=torch.float32)
+
+        n = int(self.x.shape[0])
+        if int(self.o_hist.shape[0]) != n or int(self.o_next.shape[0]) != n:
+            raise ValueError("x, o_hist, and o_next must have the same first dimension")
+        if self.y is not None and int(self.y.shape[0]) != n:
+            raise ValueError("y must have the same first dimension as x")
 
     def __len__(self) -> int:
         return int(self.x.shape[0])
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.x[idx], self.o_hist[idx], self.o_next[idx]
+    def __getitem__(
+        self, idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.y is None:
+            return self.x[idx], self.o_hist[idx], self.o_next[idx]
+        return self.x[idx], self.o_hist[idx], self.o_next[idx], self.y[idx]
 
 
 def make_sequence_pairs(

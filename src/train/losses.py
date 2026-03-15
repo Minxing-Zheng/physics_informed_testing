@@ -5,6 +5,7 @@ Loss and regularization utilities.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 def _rbf_kernel(x: torch.Tensor, y: torch.Tensor, sigmas=(0.1, 0.2, 0.5, 1.0)) -> torch.Tensor:
@@ -82,3 +83,120 @@ def energy_distance_unif(v: torch.Tensor, ref_u: torch.Tensor | None = None) -> 
     c_uu = torch.pdist(ref_u, p=2).mean()  # E||u-u'||
     c_vu = torch.cdist(v, ref_u, p=2).mean()  # E||v-u||
     return 2 * c_vu - c_vv - c_uu
+
+
+def _flatten_latent_1d(v: torch.Tensor) -> torch.Tensor:
+    """Flatten latent samples to 1D for scalar-uniform regularizers."""
+    if v.ndim == 0:
+        return v.reshape(1)
+    if v.ndim == 1:
+        return v
+    if v.ndim == 2 and v.shape[1] == 1:
+        return v[:, 0]
+    return v.reshape(-1)
+
+
+def cvm_unif(v: torch.Tensor) -> torch.Tensor:
+    """Differentiable 1D Cramer-von Mises loss to Uniform(0, 1).
+
+    Assumes the latent has already been mapped into (0, 1), e.g. by sigmoid.
+    This compares sorted samples to uniform quantile targets.
+    """
+    u = torch.sort(_flatten_latent_1d(v))[0]
+    n = u.numel()
+    if n < 2:
+        return torch.zeros((), device=v.device, dtype=v.dtype)
+    target = (torch.arange(n, device=u.device, dtype=u.dtype) + 0.5) / n
+    return torch.mean((u - target) ** 2)
+
+
+def wasserstein1_unif(v: torch.Tensor) -> torch.Tensor:
+    """Differentiable 1D Wasserstein-1 loss to Uniform(0, 1).
+
+    Assumes the latent has already been mapped into (0, 1), e.g. by sigmoid.
+    In 1D, W1 reduces to the mean absolute deviation between sorted samples and
+    the target quantile grid.
+    """
+    u = torch.sort(_flatten_latent_1d(v))[0]
+    n = u.numel()
+    if n < 2:
+        return torch.zeros((), device=v.device, dtype=v.dtype)
+    target = (torch.arange(n, device=u.device, dtype=u.dtype) + 0.5) / n
+    return torch.mean(torch.abs(u - target))
+
+
+def asymmetric_interval_l1(
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    lower: float,
+    upper: float,
+    alpha_plus: float = 2.0,
+    beta_plus: float = 1.0,
+    alpha_minus: float = 2.0,
+    beta_minus: float = 1.0,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Asymmetric L1-style loss with interval-dependent directional penalties.
+
+    This implements:
+      - y > U: alpha_plus * (y - yhat)_+ + beta_plus * (yhat - y)_+
+      - L <= y <= U: |y - yhat|
+      - y < L: alpha_minus * (yhat - y)_+ + beta_minus * (y - yhat)_+
+
+    Where (a)_+ = max(a, 0). To encourage:
+      - overestimation above ``upper``: set ``alpha_plus > beta_plus``
+      - underestimation below ``lower``: set ``alpha_minus > beta_minus``
+
+    Args:
+        y_true: Ground-truth tensor.
+        y_pred: Prediction tensor (same shape as ``y_true``).
+        lower: Lower threshold L.
+        upper: Upper threshold U, must satisfy lower < upper.
+        alpha_plus: Penalty for underestimation when y_true > upper.
+        beta_plus: Penalty for overestimation when y_true > upper.
+        alpha_minus: Penalty for overestimation when y_true < lower.
+        beta_minus: Penalty for underestimation when y_true < lower.
+        reduction: ``"none"``, ``"mean"``, or ``"sum"``.
+    """
+    if y_true.shape != y_pred.shape:
+        raise ValueError(
+            f"y_true and y_pred must have same shape, got {tuple(y_true.shape)} vs {tuple(y_pred.shape)}"
+        )
+    if float(lower) >= float(upper):
+        raise ValueError(f"Expected lower < upper, got lower={lower}, upper={upper}")
+    for name, val in {
+        "alpha_plus": alpha_plus,
+        "beta_plus": beta_plus,
+        "alpha_minus": alpha_minus,
+        "beta_minus": beta_minus,
+    }.items():
+        if float(val) < 0:
+            raise ValueError(f"{name} must be non-negative, got {val}")
+    if reduction not in {"none", "mean", "sum"}:
+        raise ValueError(f"Unsupported reduction='{reduction}', expected 'none'|'mean'|'sum'")
+
+    y_true_f = y_true.to(dtype=y_pred.dtype)
+
+    # Directional signed errors.
+    under_err = F.relu(y_true_f - y_pred)  # y_true > y_pred
+    over_err = F.relu(y_pred - y_true_f)   # y_pred > y_true
+
+    mask_hi = y_true_f > float(upper)
+    mask_lo = y_true_f < float(lower)
+    mask_mid = ~(mask_hi | mask_lo)
+
+    loss_hi = float(alpha_plus) * under_err + float(beta_plus) * over_err
+    loss_mid = torch.abs(y_true_f - y_pred)
+    loss_lo = float(alpha_minus) * over_err + float(beta_minus) * under_err
+
+    loss = (
+        mask_hi.to(loss_hi.dtype) * loss_hi
+        + mask_mid.to(loss_mid.dtype) * loss_mid
+        + mask_lo.to(loss_lo.dtype) * loss_lo
+    )
+
+    if reduction == "none":
+        return loss
+    if reduction == "sum":
+        return loss.sum()
+    return loss.mean()
