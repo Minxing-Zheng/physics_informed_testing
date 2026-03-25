@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.ipynb_checkpoints/
+
+cache/*
+!cache/.gitkeep
+
+results/*
+!results/.gitkeep
+
+experiment/results/*
+!experiment/results/figure/
+!experiment/results/figure/.gitkeep
