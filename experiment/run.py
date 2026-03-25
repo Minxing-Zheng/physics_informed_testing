@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--perturb_type", type=str, default="mean", dest="perturb_type") # {"mean", "cov"}
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--stride", type=int, default=1)
-    parser.add_argument("--loss_type", type=str, default='bce', dest="loss_type")# {"bce", "weighted", "weighted_bce", "stability_asymmetric_recon"}
+    parser.add_argument("--loss_type", type=str, default='stability_asymmetric_recon', dest="loss_type")# {"bce", "weighted", "weighted_bce", "stability_asymmetric_recon"}
     parser.add_argument(
         "--dist-mean",
         type=float,
@@ -295,7 +295,7 @@ div_kwargs = {"sigmas": None, "low_discrepancy": True}
 # )
 
 train_cfg = TrainingConfig(
-    divergence=DivergenceConfig(lambda_mmd=Cfg.lambda_mmd, fn=mmd2_unif, kwargs=div_kwargs),
+    divergence=DivergenceConfig(lambda_mmd=Cfg.lambda_mmd, fn=div_fn, kwargs=div_kwargs),
     stability=StabilityConfig(
         loss_type=Cfg.loss_type,
         threshold=Cfg.tau,
@@ -314,12 +314,12 @@ model = build_cond_gru_model(
     d_o=Cfg.d_o,
     d_v=Cfg.d_v,
     d_h=Cfg.d_h,
-    enc_layers=2,
-    dec_layers=1,
+    enc_layers=4,
+    dec_layers=2,
     hidden_enc=Cfg.hidden_enc,
     hidden_dec=Cfg.hidden_dec,
     output_activation="sigmoid",
-    dropout_rnn=0.1,
+    dropout_rnn=0.2,
 ).to(device)
 
 model_enc = EncoderOnly(copy.deepcopy(model.enc)).to(device)

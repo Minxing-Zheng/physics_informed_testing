@@ -585,6 +585,20 @@ def plot_x_safety_map_shift_panels(
     contour_mass_max=0.9,
     contour_color="black",
     contour_alpha=0.7,
+    cmap_alpha=1.0,
+    shift_mode="arrow",
+    shift_length=None,
+    original_contour_color="gray",
+    original_contour_alpha=None,
+    original_contour_linestyle="--",
+    shifted_contour_linestyle="-",
+    show_distribution_markers=True,
+    distribution_marker_size=40,
+    show_distribution_legend=True,
+    legend_fontsize=None,
+    show_contour_labels=False,
+    contour_label_fontsize=None,
+    contour_label_fmt=".2f",
     arrow_scale=1.5,
     show_arrow_text=True,
     horizontal_text_position="bottom",
@@ -594,13 +608,34 @@ def plot_x_safety_map_shift_panels(
     fontsize=10,
     linewidth=2.0,
     figsize=None,
+    colorbar=True,
+    title_fontsize=None,
+    label_fontsize=None,
+    tick_fontsize=None,
+    cbar_label_fontsize=None,
+    cbar_tick_fontsize=None,
     save_path=None,
 ):
+    """Plot X-safety-map panels with either shift arrows or Gaussian-shift comparisons."""
     if len(initial_positions) != len(directions) or len(labels) != len(initial_positions):
         raise ValueError("initial_positions, directions, and labels must have the same length.")
+    if shift_mode not in {"arrow", "distribution", "both"}:
+        raise ValueError("shift_mode must be one of 'arrow', 'distribution', or 'both'.")
+    if shift_mode in {"distribution", "both"} and cov is None:
+        raise ValueError("cov must be provided when shift_mode is 'distribution' or 'both'.")
 
     if colors is None:
         colors = ["black", "#f39c12", "#1f77b4"]
+    if cbar_label_fontsize is None:
+        cbar_label_fontsize = label_fontsize
+    if cbar_tick_fontsize is None:
+        cbar_tick_fontsize = tick_fontsize
+    if contour_label_fontsize is None:
+        contour_label_fontsize = tick_fontsize
+    if legend_fontsize is None:
+        legend_fontsize = tick_fontsize
+    if original_contour_alpha is None:
+        original_contour_alpha = contour_alpha
 
     n = len(initial_positions)
     if figsize is None:
@@ -616,9 +651,110 @@ def plot_x_safety_map_shift_panels(
         axes = [axes]
 
     mesh = None
+    sigma = None if cov is None else np.asarray(cov, dtype=float).reshape(2, 2)
+
+    def _format_contour_label(value):
+        return format(float(value), contour_label_fmt)
+
+    def _resolve_shift_delta(v):
+        vec = np.asarray(v, dtype=float).reshape(2)
+        if shift_length is None:
+            return arrow_scale * vec
+        vec_norm = np.linalg.norm(vec)
+        if vec_norm == 0.0:
+            raise ValueError("direction vectors must be non-zero when shift_length is provided.")
+        return shift_length * vec / vec_norm
+
+    def _get_mass_levels():
+        if np.isscalar(contour_levels):
+            count = int(contour_levels)
+            if count < 1:
+                raise ValueError("contour_levels must be >= 1.")
+            if not np.isclose(contour_levels, count):
+                raise ValueError("contour_levels must be an integer count or an explicit list of masses.")
+            if not (0.0 < contour_mass_max < 1.0):
+                raise ValueError("contour_mass_max must be in (0, 1).")
+            return np.linspace(contour_mass_max / count, contour_mass_max, count)
+
+        mass_levels = np.asarray(contour_levels, dtype=float).reshape(-1)
+        if mass_levels.size == 0:
+            raise ValueError("contour_levels must not be empty.")
+        if np.any((mass_levels <= 0.0) | (mass_levels >= 1.0)):
+            raise ValueError("When contour_mass=True, explicit contour_levels must lie in (0, 1).")
+        return np.sort(mass_levels)
+
+    mass_levels = _get_mass_levels() if contour_mass else None
+
+    def _draw_gaussian_contours(
+        ax,
+        mu,
+        sigma,
+        *,
+        color,
+        alpha,
+        linestyle,
+        label_contours,
+    ):
+        inv = np.linalg.inv(sigma)
+        det = np.linalg.det(sigma)
+        if det <= 0:
+            raise ValueError("cov determinant must be > 0 for contour plotting")
+
+        grid = np.stack([A_grid.ravel(), W_grid.ravel()], axis=1)
+        diff = grid - mu.reshape(1, 2)
+        quad = np.einsum("bi,ij,bj->b", diff, inv, diff)
+        Z = np.exp(-0.5 * quad) / (2 * np.pi * np.sqrt(det))
+        Z = Z.reshape(A_grid.shape)
+
+        if contour_mass:
+            density_peak = 1.0 / (2 * np.pi * np.sqrt(det))
+            density_levels = density_peak * np.exp(-0.5 * chi2.ppf(mass_levels, df=2))
+            cs = ax.contour(
+                A_grid,
+                W_grid,
+                Z,
+                levels=np.sort(density_levels),
+                colors=color,
+                linewidths=1.0,
+                alpha=alpha,
+                linestyles=linestyle,
+            )
+            if label_contours:
+                contour_label_map = {
+                    level: _format_contour_label(mass)
+                    for level, mass in zip(cs.levels, mass_levels[::-1])
+                }
+                ax.clabel(
+                    cs,
+                    cs.levels,
+                    fmt=contour_label_map,
+                    inline=True,
+                    fontsize=contour_label_fontsize,
+                )
+            return cs
+
+        cs = ax.contour(
+            A_grid,
+            W_grid,
+            Z,
+            levels=contour_levels,
+            colors=color,
+            linewidths=1.0,
+            alpha=alpha,
+            linestyles=linestyle,
+        )
+        if label_contours:
+            ax.clabel(
+                cs,
+                cs.levels,
+                fmt=lambda level: _format_contour_label(level),
+                inline=True,
+                fontsize=contour_label_fontsize,
+            )
+        return cs
 
     for ax, mu0, v, label, color in zip(axes, initial_positions, directions, labels, colors):
-        mesh_kwargs = dict(cmap=cmap, shading="auto")
+        mesh_kwargs = dict(cmap=cmap, shading="auto", alpha=cmap_alpha)
         if norm is not None:
             mesh_kwargs["norm"] = norm
         else:
@@ -627,113 +763,161 @@ def plot_x_safety_map_shift_panels(
 
         mesh = ax.pcolormesh(a_vals, w_vals, safe_grid, **mesh_kwargs)
 
-        if cov is not None:
-            mu = np.asarray(mu0, dtype=float).reshape(2)
-            sigma = np.asarray(cov, dtype=float).reshape(2, 2)
-            inv = np.linalg.inv(sigma)
-            det = np.linalg.det(sigma)
+        mu = np.asarray(mu0, dtype=float).reshape(2)
+        delta = _resolve_shift_delta(v)
+        shifted_mu = mu + delta
 
-            grid = np.stack([A_grid.ravel(), W_grid.ravel()], axis=1)
-            diff = grid - mu.reshape(1, 2)
-            quad = np.einsum("bi,ij,bj->b", diff, inv, diff)
-            Z = np.exp(-0.5 * quad) / (2 * np.pi * np.sqrt(det))
-            Z = Z.reshape(A_grid.shape)
+        if sigma is not None and shift_mode == "arrow":
+            _draw_gaussian_contours(
+                ax,
+                mu,
+                sigma,
+                color=contour_color,
+                alpha=contour_alpha,
+                linestyle="-",
+                label_contours=show_contour_labels,
+            )
 
-            if contour_mass:
-                mass_levels = np.linspace(contour_mass_max / contour_levels, contour_mass_max, contour_levels)
-                density_peak = 1.0 / (2 * np.pi * np.sqrt(det))
-                density_levels = density_peak * np.exp(-0.5 * chi2.ppf(mass_levels, df=2))
-                ax.contour(
-                    A_grid, W_grid, Z,
-                    levels=np.sort(density_levels),
-                    colors=contour_color,
-                    linewidths=1.0,
-                    alpha=contour_alpha,
+        if shift_mode in {"distribution", "both"}:
+            _draw_gaussian_contours(
+                ax,
+                mu,
+                sigma,
+                color=original_contour_color,
+                alpha=original_contour_alpha,
+                linestyle=original_contour_linestyle,
+                label_contours=False,
+            )
+            _draw_gaussian_contours(
+                ax,
+                shifted_mu,
+                sigma,
+                color=color,
+                alpha=contour_alpha,
+                linestyle=shifted_contour_linestyle,
+                label_contours=show_contour_labels,
+            )
+            if show_distribution_markers:
+                ax.scatter(
+                    [mu[0]],
+                    [mu[1]],
+                    facecolors="none",
+                    edgecolors=original_contour_color,
+                    s=distribution_marker_size,
+                    zorder=5,
                 )
-            else:
-                ax.contour(
-                    A_grid, W_grid, Z,
-                    levels=contour_levels,
-                    colors=contour_color,
-                    linewidths=1.0,
-                    alpha=contour_alpha,
-                )
-
-        x0, y0 = mu0
-        vx, vy = v
-        dx = arrow_scale * vx
-        dy = arrow_scale * vy
-
-        ax.scatter([x0], [y0], color=color, s=40, zorder=5)
-        ax.arrow(
-            x0, y0, dx, dy,
-            color=color,
-            linewidth=linewidth,
-            head_width=0.06,
-            head_length=0.08,
-            length_includes_head=True,
-            zorder=5,
-        )
-
-        x1 = x0 + dx
-        y1 = y0 + dy
-
-        xlim = ax.get_xlim()
-        ylim = ax.get_ylim()
-
-        x1_vis = min(max(x1, xlim[0]), xlim[1])
-        y1_vis = min(max(y1, ylim[0]), ylim[1])
-
-        x_mid = 0.5 * (x0 + x1_vis)
-        y_mid = 0.5 * (y0 + y1_vis)
-
-        if show_arrow_text:
-            if abs(dx) >= abs(dy):
-                y_text = y_mid + text_pad if horizontal_text_position == "top" else y_mid - text_pad
-                va = "bottom" if horizontal_text_position == "top" else "top"
-                ax.text(
-                    x_mid, y_text, label,
+                ax.scatter(
+                    [shifted_mu[0]],
+                    [shifted_mu[1]],
                     color=color,
-                    fontsize=fontsize,
-                    ha="center",
-                    va=va,
-                    bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
-                    zorder=6,
+                    s=distribution_marker_size,
+                    zorder=5,
                 )
-            else:
-                x_text = x_mid + text_pad if vertical_text_position == "right" else x_mid - text_pad
-                ha = "left" if vertical_text_position == "right" else "right"
-                ax.text(
-                    x_text, y_mid, label,
-                    color=color,
-                    fontsize=fontsize,
-                    ha=ha,
-                    va="center",
-                    bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
-                    zorder=6,
-                )
+            if show_distribution_legend:
+                from matplotlib.lines import Line2D
 
-        #ax.set_title(rf"{label}: $\mu_0={mu0}$, $v={v}$")
-        ax.set_title(rf"{label}")
-        ax.set_xlabel("A")
+                handles = [
+                    Line2D(
+                        [0],
+                        [0],
+                        color=original_contour_color,
+                        lw=1.5,
+                        alpha=original_contour_alpha,
+                        linestyle=original_contour_linestyle,
+                        label="Baseline",
+                    ),
+                    Line2D(
+                        [0],
+                        [0],
+                        color=color,
+                        lw=1.5,
+                        alpha=contour_alpha,
+                        linestyle=shifted_contour_linestyle,
+                        label="Shifted",
+                    ),
+                ]
+                ax.legend(handles=handles, loc="lower right", fontsize=legend_fontsize)
+
+        if shift_mode in {"arrow", "both"}:
+            x0, y0 = mu
+            dx, dy = delta
+
+            ax.scatter([x0], [y0], color=color, s=40, zorder=5)
+            ax.arrow(
+                x0, y0, dx, dy,
+                color=color,
+                linewidth=linewidth,
+                head_width=0.06,
+                head_length=0.08,
+                length_includes_head=True,
+                zorder=5,
+            )
+
+            x1 = x0 + dx
+            y1 = y0 + dy
+
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+
+            x1_vis = min(max(x1, xlim[0]), xlim[1])
+            y1_vis = min(max(y1, ylim[0]), ylim[1])
+
+            x_mid = 0.5 * (x0 + x1_vis)
+            y_mid = 0.5 * (y0 + y1_vis)
+
+            if show_arrow_text:
+                if abs(dx) >= abs(dy):
+                    y_text = y_mid + text_pad if horizontal_text_position == "top" else y_mid - text_pad
+                    va = "bottom" if horizontal_text_position == "top" else "top"
+                    ax.text(
+                        x_mid, y_text, label,
+                        color=color,
+                        fontsize=fontsize,
+                        ha="center",
+                        va=va,
+                        bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
+                        zorder=6,
+                    )
+                else:
+                    x_text = x_mid + text_pad if vertical_text_position == "right" else x_mid - text_pad
+                    ha = "left" if vertical_text_position == "right" else "right"
+                    ax.text(
+                        x_text, y_mid, label,
+                        color=color,
+                        fontsize=fontsize,
+                        ha=ha,
+                        va="center",
+                        bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
+                        zorder=6,
+                    )
+
+        ax.set_title(rf"{label}", fontsize=title_fontsize)
+        ax.set_xlabel("A", fontsize=label_fontsize)
+        ax.tick_params(axis="both", labelsize=tick_fontsize)
         ax.grid(False)
 
-    axes[0].set_ylabel("omega")
-    fig.subplots_adjust(right=0.92)
-    cbar_ax = fig.add_axes([0.93, 0.15, 0.02, 0.70])
-    # fig.colorbar(mesh, cax=cbar_ax, label="safe (1) / unsafe (0)")
-
-    cbar = fig.colorbar(
-        mesh,
-        cax=cbar_ax,
-        label="Stable (1) / Unstable (0)",
-        ticks=[0, 1],
-    )
-    cbar.ax.set_yticklabels(["0", "1"])
+    axes[0].set_ylabel(r"$\omega$", fontsize=label_fontsize)
     if title_prefix:
-        fig.suptitle(title_prefix, y=1.02)
+        fig.suptitle(title_prefix, y=1.02, fontsize=title_fontsize)
 
-    fig.tight_layout(rect=[0, 0, 0.92, 1])
+    if colorbar:
+        fig.subplots_adjust(right=0.92)
+        cbar_ax = fig.add_axes([0.93, 0.15, 0.02, 0.70])
+        # fig.colorbar(mesh, cax=cbar_ax, label="safe (1) / unsafe (0)")
+        cbar = fig.colorbar(
+            mesh,
+            cax=cbar_ax,
+            label="Stable (1) / Unstable (0)",
+            ticks=[0, 1],
+        )
+        cbar.ax.set_yticklabels(["0", "1"])
+        if cbar_label_fontsize is not None:
+            cbar.set_label("Stable (1) / Unstable (0)", fontsize=cbar_label_fontsize)
+        if cbar_tick_fontsize is not None:
+            cbar.ax.tick_params(labelsize=cbar_tick_fontsize)
+        fig.tight_layout(rect=[0, 0, 0.92, 1])
+    else:
+        fig.tight_layout()
 
     # if title_prefix:
     #     fig.suptitle(title_prefix, y=1.02)
@@ -747,6 +931,273 @@ def plot_x_safety_map_shift_panels(
     return fig, axes
 
 def plot_x_safety_map_cov_panels(
+    res,
+    covariances,
+    labels,
+    *,
+    mean=(0.0, 0.0),
+    reference_cov=None,
+    show_reference=True,
+    reference_color="gray",
+    reference_alpha=0.8,
+    reference_linestyle="--",
+    reference_linewidth=1.0,
+    title_prefix="",
+    cmap="RdYlGn",
+    norm=None,
+    contour_levels=5,
+    contour_mass=True,
+    contour_mass_max=0.8,
+    contour_color="black",
+    contour_alpha=0.7,
+    cmap_alpha=1.0,
+    show_mean_marker=True,
+    mean_marker_color="black",
+    mean_marker_size=40,
+    figsize=None,
+    colorbar=True,
+    show_distribution_legend=True,
+    legend_fontsize=None,
+    reference_label="Baseline",
+    shifted_label="Shifted",
+    show_contour_labels=False,
+    contour_label_fontsize=None,
+    contour_label_fmt=".2f",
+    title_fontsize=None,
+    label_fontsize=None,
+    tick_fontsize=None,
+    cbar_label_fontsize=None,
+    cbar_tick_fontsize=None,
+    save_path=None,
+):
+    """
+    Plot one row of X-safety-map panels, each with the same background safety map
+    and a different Gaussian covariance overlay.
+
+    Parameters
+    ----------
+    res : dict
+        Output from compute_x_safety_map.
+    covariances : list of array-like, each shape (2, 2)
+        One covariance matrix per panel.
+    labels : list[str]
+        One title label per panel.
+    mean : tuple[float, float] or array-like shape (2,)
+        Common Gaussian mean for all panels.
+    contour_mass : bool
+        If True, contour_levels are probability-mass levels up to contour_mass_max.
+        If False, uses standard matplotlib contour level behavior on the pdf.
+    """
+    if len(covariances) != len(labels):
+        raise ValueError("covariances and labels must have the same length.")
+    if cbar_label_fontsize is None:
+        cbar_label_fontsize = label_fontsize
+    if cbar_tick_fontsize is None:
+        cbar_tick_fontsize = tick_fontsize
+    if contour_label_fontsize is None:
+        contour_label_fontsize = tick_fontsize
+    if legend_fontsize is None:
+        legend_fontsize = tick_fontsize
+
+    mean = np.asarray(mean, dtype=float).reshape(2)
+    reference_cov = None if reference_cov is None else np.asarray(reference_cov, dtype=float).reshape(2, 2)
+
+    a_vals = res["A"]
+    w_vals = res["omega"]
+    safe_grid = res["safe"]
+    A_grid, W_grid = np.meshgrid(a_vals, w_vals, indexing="xy")
+
+    n = len(covariances)
+    if figsize is None:
+        figsize = (4.5 * n, 4.2)
+
+    fig, axes = plt.subplots(1, n, figsize=figsize, sharex=True, sharey=True)
+    if n == 1:
+        axes = [axes]
+
+    mesh = None
+
+    def _format_contour_label(value):
+        return format(float(value), contour_label_fmt)
+
+    def _get_mass_levels():
+        if np.isscalar(contour_levels):
+            count = int(contour_levels)
+            if count < 1:
+                raise ValueError("contour_levels must be >= 1.")
+            if not np.isclose(contour_levels, count):
+                raise ValueError("contour_levels must be an integer count or an explicit list of masses.")
+            if not (0.0 < contour_mass_max < 1.0):
+                raise ValueError("contour_mass_max must be in (0, 1).")
+            return np.linspace(contour_mass_max / count, contour_mass_max, count)
+
+        mass_levels = np.asarray(contour_levels, dtype=float).reshape(-1)
+        if mass_levels.size == 0:
+            raise ValueError("contour_levels must not be empty.")
+        if np.any((mass_levels <= 0.0) | (mass_levels >= 1.0)):
+            raise ValueError("When contour_mass=True, explicit contour_levels must lie in (0, 1).")
+        return np.sort(mass_levels)
+
+    mass_levels = _get_mass_levels() if contour_mass else None
+
+    for ax, sigma, label in zip(axes, covariances, labels):
+        sigma = np.asarray(sigma, dtype=float).reshape(2, 2)
+
+        mesh_kwargs = dict(cmap=cmap, shading="auto", alpha=cmap_alpha)
+        if norm is not None:
+            mesh_kwargs["norm"] = norm
+        else:
+            mesh_kwargs["vmin"] = 0.0
+            mesh_kwargs["vmax"] = 1.0
+
+        mesh = ax.pcolormesh(a_vals, w_vals, safe_grid, **mesh_kwargs)
+
+        grid = np.stack([A_grid.ravel(), W_grid.ravel()], axis=1)
+        diff = grid - mean.reshape(1, 2)
+
+        def _draw_cov_contour(cov_mat, *, color, alpha, linestyle, linewidth, label_contours):
+            inv = np.linalg.inv(cov_mat)
+            det = np.linalg.det(cov_mat)
+            if det <= 0:
+                raise ValueError("Each covariance determinant must be > 0.")
+            quad = np.einsum("bi,ij,bj->b", diff, inv, diff)
+            Z = np.exp(-0.5 * quad) / (2 * np.pi * np.sqrt(det))
+            Z = Z.reshape(A_grid.shape)
+
+            if contour_mass:
+                density_peak = 1.0 / (2 * np.pi * np.sqrt(det))
+                density_levels = density_peak * np.exp(-0.5 * chi2.ppf(mass_levels, df=2))
+                cs = ax.contour(
+                    A_grid,
+                    W_grid,
+                    Z,
+                    levels=np.sort(density_levels),
+                    colors=color,
+                    linewidths=linewidth,
+                    alpha=alpha,
+                    linestyles=linestyle,
+                )
+                if label_contours:
+                    contour_label_map = {
+                        level: _format_contour_label(mass)
+                        for level, mass in zip(cs.levels, mass_levels[::-1])
+                    }
+                    ax.clabel(
+                        cs,
+                        cs.levels,
+                        fmt=contour_label_map,
+                        inline=True,
+                        fontsize=contour_label_fontsize,
+                    )
+            else:
+                cs = ax.contour(
+                    A_grid,
+                    W_grid,
+                    Z,
+                    levels=contour_levels,
+                    colors=color,
+                    linewidths=linewidth,
+                    alpha=alpha,
+                    linestyles=linestyle,
+                )
+                if label_contours:
+                    ax.clabel(
+                        cs,
+                        cs.levels,
+                        fmt=lambda level: _format_contour_label(level),
+                        inline=True,
+                        fontsize=contour_label_fontsize,
+                    )
+
+        if show_reference and reference_cov is not None:
+            _draw_cov_contour(
+                reference_cov,
+                color=reference_color,
+                alpha=reference_alpha,
+                linestyle=reference_linestyle,
+                linewidth=reference_linewidth,
+                label_contours=False,
+            )
+
+        _draw_cov_contour(
+            sigma,
+            color=contour_color,
+            alpha=contour_alpha,
+            linestyle="-",
+            linewidth=1.0,
+            label_contours=show_contour_labels,
+        )
+
+        if show_mean_marker:
+            ax.scatter(
+                [mean[0]],
+                [mean[1]],
+                color=mean_marker_color,
+                s=mean_marker_size,
+                zorder=5,
+            )
+
+        if show_distribution_legend:
+            from matplotlib.lines import Line2D
+
+            handles = []
+            if show_reference and reference_cov is not None:
+                handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        color=reference_color,
+                        lw=reference_linewidth,
+                        alpha=reference_alpha,
+                        linestyle=reference_linestyle,
+                        label=reference_label,
+                    )
+                )
+            handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color=contour_color,
+                    lw=1.5,
+                    alpha=contour_alpha,
+                    linestyle="-",
+                    label=shifted_label,
+                )
+            )
+            ax.legend(handles=handles, loc="lower right", fontsize=legend_fontsize)
+
+        ax.set_title(label, fontsize=title_fontsize)
+        ax.set_xlabel("A", fontsize=label_fontsize)
+        ax.tick_params(axis="both", labelsize=tick_fontsize)
+        ax.grid(False)
+
+    axes[0].set_ylabel(r"$\omega$", fontsize=label_fontsize)
+
+    if title_prefix:
+        fig.suptitle(title_prefix, y=1.02, fontsize=title_fontsize)
+
+    if colorbar:
+        subplot_right = 0.90
+        cbar_left = 0.92
+        fig.subplots_adjust(right=subplot_right)
+        cbar_ax = fig.add_axes([cbar_left, 0.15, 0.02, 0.70])
+        cbar = fig.colorbar(mesh, cax=cbar_ax, label="Stable (1) / Unstable (0)", ticks=[0, 1])
+        if cbar_label_fontsize is not None:
+            cbar.set_label("Stable (1) / Unstable (0)", fontsize=cbar_label_fontsize)
+        if cbar_tick_fontsize is not None:
+            cbar.ax.tick_params(labelsize=cbar_tick_fontsize)
+        fig.tight_layout(rect=[0, 0, subplot_right, 1])
+    else:
+        fig.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+
+    return fig, axes
+
+
+def plot_x_safety_map_cov_panels_no_bar(
     res,
     covariances,
     labels,
@@ -900,27 +1351,29 @@ def plot_x_safety_map_cov_panels(
             )
 
         ax.set_title(label)
-        ax.set_xlabel("A")
+        ax.set_xlabel("Feature 1")
         ax.grid(False)
 
-    axes[0].set_ylabel("omega")
+    axes[0].set_ylabel("Feature 2")
 
-    subplot_right = 0.90
-    cbar_left = 0.92
-    fig.subplots_adjust(right=subplot_right)
-    cbar_ax = fig.add_axes([cbar_left, 0.15, 0.02, 0.70])
-    fig.colorbar(mesh, cax=cbar_ax, label="Stable (1) / Unstable (0)", ticks=[0, 1])
+    # subplot_right = 0.90
+    # cbar_left = 0.92
+    # fig.subplots_adjust(right=subplot_right)
+    # cbar_ax = fig.add_axes([cbar_left, 0.15, 0.02, 0.70])
+    # fig.colorbar(mesh, cax=cbar_ax, label="Stable (1) / Unstable (0)", ticks=[0, 1])
 
-    if title_prefix:
-        fig.suptitle(title_prefix, y=1.02)
+    # if title_prefix:
+    #     fig.suptitle(title_prefix, y=1.02)
 
-    fig.tight_layout(rect=[0, 0, subplot_right, 1])
+    # fig.tight_layout(rect=[0, 0, subplot_right, 1])
 
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    # if save_path:
+    #     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    #     fig.savefig(save_path, dpi=200, bbox_inches="tight")
 
     return fig, axes
+
+
 
 def annotate_covariance_change(
     ax,

@@ -1,0 +1,51 @@
+{
+  "seed": 63,
+  "n_samples": 8000,
+  "test_n_samples": 2000,
+  "T": 10.0,
+  "perturb_type": "mean",
+  "dt": 0.05,
+  "stride": 1,
+  "loss_type": "stability_asymmetric_recon",
+  "dist_mean": [
+    0.0,
+    0.0
+  ],
+  "dist_cov_diag": [
+    1.0,
+    1.0
+  ],
+  "batch_train": 1024,
+  "batch_val": 512,
+  "num_workers": 4,
+  "latent_batch_size": 4096,
+  "epochs": 150,
+  "lr": 0.003,
+  "weight_decay": 1e-05,
+  "lr_enc": 0.003,
+  "weight_decay_enc": 1e-05,
+  "lambda_mmd": 0.01,
+  "d_x": 2,
+  "d_o": 1,
+  "d_v": 1,
+  "d_h": 128,
+  "hidden_enc": 512,
+  "hidden_dec": 128,
+  "tau": 1.0,
+  "asym_recon_delta": 10.0,
+  "time_window": [
+    6.0,
+    10.0
+  ],
+  "output_dir": "results/diagnostics_results_baselines/seed_63_lr_0p003_lambda_mmd_0p01_loss_type_stability_asymmetric_recon_tau_1_perturb_type_mean_epochs_150_n_8000",
+  "dist_cov": [
+    [
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      1.0
+    ]
+  ]
+}

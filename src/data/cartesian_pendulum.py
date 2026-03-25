@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from typing import Callable, Tuple
 
 import numpy as np
+from scipy.stats import beta as beta_distribution
+from scipy.stats import norm, truncnorm
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,116 @@ class CartesianPendulumParams:
             raise ValueError("length must be positive")
         if self.gravity <= 0:
             raise ValueError("gravity must be positive")
+
+
+@dataclass(frozen=True)
+class DistributionConfig:
+    """Configuration for a bounded scalar distribution."""
+
+    kind: str
+    bounds: tuple[float, float]
+    loc: float | None = None
+    scale: float | None = None
+    alpha: float | None = None
+    beta: float | None = None
+
+    def validate(self, name: str) -> tuple[float, float]:
+        lo, hi = _validate_range(f"{name}.bounds", self.bounds)
+        kind = self.kind.strip().lower()
+        if kind == "uniform":
+            return lo, hi
+        if kind in ("gaussian", "normal"):
+            if self.loc is None or self.scale is None:
+                raise ValueError(f"{name} gaussian config requires loc and scale")
+            if self.scale < 0:
+                raise ValueError(f"{name}.scale must be >= 0")
+            return lo, hi
+        if kind == "beta":
+            if self.alpha is None or self.beta is None:
+                raise ValueError(f"{name} beta config requires alpha and beta")
+            if self.alpha <= 0 or self.beta <= 0:
+                raise ValueError(f"{name} beta parameters must be positive")
+            return lo, hi
+        raise ValueError(f"{name}.kind must be 'uniform', 'gaussian', or 'beta'")
+
+
+def _validate_range(name: str, values: tuple[float, float]) -> tuple[float, float]:
+    if len(values) != 2:
+        raise ValueError(f"{name} must be a tuple/list of length 2")
+    lo, hi = float(values[0]), float(values[1])
+    if lo > hi:
+        raise ValueError(f"{name} lower bound must be <= upper bound")
+    return lo, hi
+
+
+def _sample_from_config(
+    rng: np.random.Generator,
+    n_samples: int,
+    name: str,
+    config: DistributionConfig,
+) -> np.ndarray:
+    u = rng.uniform(np.finfo(float).eps, 1.0 - np.finfo(float).eps, size=n_samples)
+    return _sample_from_config_with_u(name=name, config=config, u=u)
+
+
+def _sample_from_config_with_u(
+    name: str,
+    config: DistributionConfig,
+    u: np.ndarray,
+) -> np.ndarray:
+    lo, hi = config.validate(name)
+    kind = config.kind.strip().lower()
+    u = np.asarray(u, dtype=float)
+    u = np.clip(u, np.finfo(float).eps, 1.0 - np.finfo(float).eps)
+
+    if kind == "uniform":
+        return lo + (hi - lo) * u
+    if kind in ("gaussian", "normal"):
+        scale = float(config.scale)
+        if scale == 0.0:
+            return np.full_like(u, fill_value=np.clip(float(config.loc), lo, hi), dtype=float)
+        a = (lo - float(config.loc)) / scale
+        b = (hi - float(config.loc)) / scale
+        return truncnorm.ppf(u, a=a, b=b, loc=float(config.loc), scale=scale)
+
+    samples01 = beta_distribution.ppf(u, float(config.alpha), float(config.beta))
+    return lo + (hi - lo) * samples01
+
+
+def _normalize_sigma_spec(
+    sigma_spec: float | list[float] | tuple[float, ...],
+) -> tuple[float, float]:
+    if np.isscalar(sigma_spec):
+        sigma = float(sigma_spec)
+        if sigma < 0:
+            raise ValueError("sigma_spec must be non-negative")
+        return sigma, sigma
+
+    values = tuple(float(x) for x in sigma_spec)
+    if len(values) == 1:
+        sigma = values[0]
+        if sigma < 0:
+            raise ValueError("sigma_spec must be non-negative")
+        return sigma, sigma
+    if len(values) == 2:
+        return _validate_range("sigma_spec", (values[0], values[1]))
+    raise ValueError("sigma_spec must be a scalar, [sigma], or (low, high)")
+
+
+def _sample_correlated_uniform_pair(
+    rng: np.random.Generator,
+    n_samples: int,
+    correlation: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    rho = float(correlation)
+    if not (-0.999999 <= rho <= 0.999999):
+        raise ValueError("correlation must be in [-0.999999, 0.999999]")
+
+    cov = np.array([[1.0, rho], [rho, 1.0]], dtype=float)
+    z = rng.multivariate_normal(mean=np.zeros(2, dtype=float), cov=cov, size=n_samples)
+    u = norm.cdf(z)
+    eps = np.finfo(float).eps
+    return np.clip(u[:, 0], eps, 1.0 - eps), np.clip(u[:, 1], eps, 1.0 - eps)
 
 
 def _validate_time_grid(t_final: float, dt: float) -> np.ndarray:
@@ -91,77 +203,55 @@ def _lambda_closed_form(
 
 def sample_X_shake_pulse(
     n_samples: int,
-    A_distribution: str = "uniform",
-    A_range: tuple[float, float] = (0.10, 0.35),
-    A_loc: float = 1.0,
-    A_scale: float = 0.3,
-    bound_A: tuple[float, float] | None = None,
-    omega_distribution: str = "uniform",
-    omega_range: tuple[float, float] = (1.0, 3.0),
-    omega_loc: float = 2.0,
-    omega_scale: float = 0.5,
-    bound_omega: tuple[float, float] | None = None,
-    tau_range: tuple[float, float] = (0.45, 1.2),
+    A_config: DistributionConfig | None = None,
+    omega_config: DistributionConfig | None = None,
+    sigma_range: float | list[float] | tuple[float, ...] = (0.45, 1.2),
+    correlation: float = 0.0,
     t0: float | None = None,
     q: tuple[float, float, float] = (1.0, 0.0, 0.0),
     a0: tuple[float, float, float] = (0.0, 0.0, 0.0),
     seed: int | None = 21,
 ) -> np.ndarray:
-    """Sample pulse contexts X with columns [A, omega, tau, t0, qx, qy, qz, a0x, a0y, a0z]."""
+    """
+    Sample pulse contexts X with columns
+    [A, omega, sigma, t0, qx, qy, qz, a0x, a0y, a0z].
 
-    def _validate_range(name: str, values: tuple[float, float]) -> tuple[float, float]:
-        if len(values) != 2:
-            raise ValueError(f"{name} must be a tuple/list of length 2")
-        lo, hi = float(values[0]), float(values[1])
-        if lo > hi:
-            raise ValueError(f"{name} lower bound must be <= upper bound")
-        return lo, hi
+    ``A_config`` and ``omega_config`` each describe one bounded distribution:
+    - ``DistributionConfig(kind="uniform", bounds=(lo, hi))``
+    - ``DistributionConfig(kind="gaussian", bounds=(lo, hi), loc=..., scale=...)``
+    - ``DistributionConfig(kind="beta", bounds=(lo, hi), alpha=..., beta=...)``
 
-    def _sample_param(
-        rng: np.random.Generator,
-        name: str,
-        distribution: str,
-        uniform_range: tuple[float, float],
-        loc: float,
-        scale: float,
-        bounds: tuple[float, float] | None,
-    ) -> np.ndarray:
-        dist = str(distribution).strip().lower()
-        if dist == "uniform":
-            lo, hi = _validate_range(f"{name}_range", uniform_range)
-            samples = rng.uniform(lo, hi, size=n_samples)
-        elif dist in ("gaussian", "normal"):
-            if scale < 0:
-                raise ValueError(f"{name}_scale must be >= 0")
-            samples = rng.normal(loc=float(loc), scale=float(scale), size=n_samples)
-        else:
-            raise ValueError(
-                f"{name}_distribution must be 'uniform' or 'gaussian', got '{distribution}'"
-            )
-
-        if bounds is not None:
-            b_lo, b_hi = _validate_range(f"bound_{name}", bounds)
-            samples = np.clip(samples, b_lo, b_hi)
-        return samples
+    ``correlation`` couples ``A`` and ``omega`` through a Gaussian copula, so you
+    can keep the marginal configs above while controlling dependence separately.
+    """
 
     if n_samples <= 0:
         raise ValueError("n_samples must be > 0")
 
     rng = np.random.default_rng(seed)
 
-    A = _sample_param(rng, "A", A_distribution, A_range, A_loc, A_scale, bound_A)
-    omega = _sample_param(
-        rng,
-        "omega",
-        omega_distribution,
-        omega_range,
-        omega_loc,
-        omega_scale,
-        bound_omega,
-    )
+    if A_config is None:
+        A_config = DistributionConfig(kind="uniform", bounds=(0.10, 0.35))
+    if omega_config is None:
+        omega_config = DistributionConfig(kind="uniform", bounds=(1.0, 3.0))
 
-    tau_lo, tau_hi = _validate_range("tau_range", tau_range)
-    tau = rng.uniform(tau_lo, tau_hi, size=n_samples)
+    if abs(float(correlation)) < 1e-12:
+        A = _sample_from_config(rng, n_samples=n_samples, name="A_config", config=A_config)
+        omega = _sample_from_config(rng, n_samples=n_samples, name="omega_config", config=omega_config)
+    else:
+        u_A, u_omega = _sample_correlated_uniform_pair(
+            rng=rng,
+            n_samples=n_samples,
+            correlation=correlation,
+        )
+        A = _sample_from_config_with_u(name="A_config", config=A_config, u=u_A)
+        omega = _sample_from_config_with_u(name="omega_config", config=omega_config, u=u_omega)
+
+    sigma_lo, sigma_hi = _normalize_sigma_spec(sigma_range)
+    if sigma_lo == sigma_hi:
+        sigma = np.full(n_samples, sigma_lo, dtype=float)
+    else:
+        sigma = rng.uniform(sigma_lo, sigma_hi, size=n_samples)
     t0_vals = np.full(n_samples, np.nan if t0 is None else float(t0), dtype=float)
 
     q_arr = np.asarray(q, dtype=float)
@@ -175,7 +265,7 @@ def sample_X_shake_pulse(
     q_all = np.tile(q_arr[None, :], (n_samples, 1))
     a0_all = np.tile(a0_arr[None, :], (n_samples, 1))
 
-    return np.column_stack([A, omega, tau, t0_vals, q_all, a0_all])
+    return np.column_stack([A, omega, sigma, t0_vals, q_all, a0_all])
 
 
 def pivot_shake_pulse_batch(t: float, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -185,7 +275,7 @@ def pivot_shake_pulse_batch(t: float, X: np.ndarray) -> tuple[np.ndarray, np.nda
 
     A = X[:, 0]
     omega = X[:, 1]
-    tau = np.maximum(X[:, 2], 1e-6)
+    sigma = np.maximum(X[:, 2], 1e-6)
     t0 = np.where(np.isnan(X[:, 3]), 5.0, X[:, 3])
     q = X[:, 4:7]
     a0 = X[:, 7:10]
@@ -194,15 +284,15 @@ def pivot_shake_pulse_batch(t: float, X: np.ndarray) -> tuple[np.ndarray, np.nda
     q = q / np.maximum(q_norm, 1e-12)
 
     s = t - t0
-    env = np.exp(-(s**2) / (2.0 * tau**2))
+    env = np.exp(-(s**2) / (2.0 * sigma**2))
     sin_term = np.sin(omega * s)
     cos_term = np.cos(omega * s)
 
     amp = A * env * sin_term
-    amp_dot = A * env * ((-s / (tau**2)) * sin_term + omega * cos_term)
+    amp_dot = A * env * ((-s / (sigma**2)) * sin_term + omega * cos_term)
     amp_ddot = A * env * (
-        (s**2 / (tau**4) - 1.0 / (tau**2) - omega**2) * sin_term
-        - 2.0 * omega * s / (tau**2) * cos_term
+        (s**2 / (sigma**4) - 1.0 / (sigma**2) - omega**2) * sin_term
+        - 2.0 * omega * s / (sigma**2) * cos_term
     )
 
     a = a0 + amp[:, None] * q
@@ -293,6 +383,214 @@ def simulate_cartesian_pendulum_custom(
     return out
 
 
+def compute_cartesian_mu_safety_map(
+    params: CartesianPendulumParams,
+    t_final: float,
+    dt: float,
+    window: Tuple[float, float] | None,
+    threshold: float,
+    A_limits: tuple[float, float] = (0.01, 0.5),
+    omega_limits: tuple[float, float] = (1.0, 5.0),
+    n_A_grid: int = 25,
+    n_omega_grid: int = 25,
+    n_per_cell: int = 1000,
+    sigma_range: float | list[float] | tuple[float, ...] = (0.45, 1.2),
+    t0: float | None = None,
+    q: tuple[float, float, float] = (1.0, 0.0, 0.0),
+    a0: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    eta: float = 0.1,
+    pivot_eval: Callable[[float, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray]] = pivot_shake_pulse_batch,
+    n0: np.ndarray = np.array([0.15, 0.0, -0.9887]),
+    rel_v0: np.ndarray = np.array([0.0, 0.8, 0.0]),
+    project_each_step: bool = True,
+    seed: int = 21,
+) -> dict[str, np.ndarray | float | int | tuple[float, float]]:
+    """
+    Estimate safety probability on an ``(A, omega)`` grid for the Cartesian pendulum.
+
+    Each grid cell fixes ``A`` and ``omega`` and samples the remaining pulse context
+    randomness through ``sigma_range``.
+    """
+
+    params.validate()
+    if n_A_grid < 2 or n_omega_grid < 2:
+        raise ValueError("n_A_grid and n_omega_grid must both be >= 2")
+    if n_per_cell <= 0:
+        raise ValueError("n_per_cell must be > 0")
+    if not (0.0 <= eta < 1.0):
+        raise ValueError("eta must be in [0, 1)")
+
+    A_lo, A_hi = _validate_range("A_limits", A_limits)
+    omega_lo, omega_hi = _validate_range("omega_limits", omega_limits)
+    A_vals = np.linspace(A_lo, A_hi, n_A_grid)
+    omega_vals = np.linspace(omega_lo, omega_hi, n_omega_grid)
+
+    p_safe_grid = np.zeros((n_A_grid, n_omega_grid), dtype=float)
+    seed_seq = np.random.SeedSequence(seed)
+    child_seeds = seed_seq.spawn(n_A_grid * n_omega_grid)
+
+    idx = 0
+    for j, A_val in enumerate(A_vals):
+        for i, omega_val in enumerate(omega_vals):
+            cell_seed = int(child_seeds[idx].generate_state(1)[0])
+            idx += 1
+
+            X = sample_X_shake_pulse(
+                n_samples=n_per_cell,
+                A_config=DistributionConfig(kind="uniform", bounds=(A_val, A_val)),
+                omega_config=DistributionConfig(kind="uniform", bounds=(omega_val, omega_val)),
+                sigma_range=sigma_range,
+                t0=t0,
+                q=q,
+                a0=a0,
+                seed=cell_seed,
+            )
+            traj = simulate_cartesian_pendulum_custom(
+                params=params,
+                t_final=t_final,
+                dt=dt,
+                X=X,
+                pivot_eval=pivot_eval,
+                n0=n0,
+                rel_v0=rel_v0,
+                project_each_step=project_each_step,
+            )
+            safe_mask = check_cartesian_safety(traj, threshold=threshold, window=window)
+            p_safe_grid[j, i] = float(np.mean(safe_mask))
+
+    threshold_value = 1.0 - float(eta)
+    config_safe_grid = (p_safe_grid >= threshold_value).astype(float)
+    config_safe = int(float(np.mean(p_safe_grid)) >= threshold_value)
+
+    return {
+        "A": A_vals,
+        "omega": omega_vals,
+        "mu1": A_vals,
+        "mu2": omega_vals,
+        "p_safe_grid": p_safe_grid,
+        "safe": p_safe_grid,
+        "config_safe_grid": config_safe_grid,
+        "config_safe": config_safe,
+        "threshold": threshold_value,
+        "eta": float(eta),
+        "window": window,
+        "theta_threshold_deg": float(threshold),
+        "sigma_range": _normalize_sigma_spec(sigma_range),
+    }
+
+
+def compute_cartesian_x_safety_map(
+    params: CartesianPendulumParams,
+    t_final: float,
+    dt: float,
+    window: Tuple[float, float] | None,
+    threshold: float,
+    n_grid: int = 25,
+    box_limits: tuple[float, float] | tuple[tuple[float, float], tuple[float, float]] = ((0.01, 0.5), (1.0, 5.0)),
+    sigma_range: float | list[float] | tuple[float, ...] = 1.0,
+    n_per_cell: int = 1,
+    correlation: float = 0.0,
+    t0: float | None = None,
+    q: tuple[float, float, float] = (1.0, 0.0, 0.0),
+    a0: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    eta: float = 0.1,
+    pivot_eval: Callable[[float, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray]] = pivot_shake_pulse_batch,
+    n0: np.ndarray = np.array([0.15, 0.0, -0.9887]),
+    rel_v0: np.ndarray = np.array([0.0, 0.8, 0.0]),
+    project_each_step: bool = True,
+    seed: int = 21,
+) -> dict[str, np.ndarray | float | int | tuple[float, float] | None]:
+    """
+    Cartesian analogue of ``compute_x_safety_map`` over an ``(A, omega)`` box.
+
+    Each grid cell fixes the center values of ``A`` and ``omega``. If ``n_per_cell=1``
+    and ``sigma_range`` is fixed, this behaves like a deterministic grid evaluation.
+    If ``n_per_cell>1`` and/or ``sigma_range`` spans an interval, the returned
+    ``safe`` grid is the estimated safety probability at each cell.
+    """
+
+    params.validate()
+    if n_grid <= 1:
+        raise ValueError("n_grid must be > 1")
+    if n_per_cell <= 0:
+        raise ValueError("n_per_cell must be > 0")
+    if not (0.0 <= eta < 1.0):
+        raise ValueError("eta must be in [0, 1)")
+
+    if isinstance(box_limits[0], (tuple, list, np.ndarray)):
+        if len(box_limits) != 2:
+            raise ValueError("box_limits must be (low, high) or ((lowA, highA), (lowW, highW))")
+        A_lim = tuple(box_limits[0])  # type: ignore[arg-type]
+        omega_lim = tuple(box_limits[1])  # type: ignore[arg-type]
+    else:
+        if len(box_limits) != 2:
+            raise ValueError("box_limits must be (low, high) or ((lowA, highA), (lowW, highW))")
+        shared = (float(box_limits[0]), float(box_limits[1]))  # type: ignore[index]
+        A_lim = shared
+        omega_lim = shared
+
+    A_lo, A_hi = _validate_range("A_limits", (float(A_lim[0]), float(A_lim[1])))
+    omega_lo, omega_hi = _validate_range("omega_limits", (float(omega_lim[0]), float(omega_lim[1])))
+    sigma_pair = _normalize_sigma_spec(sigma_range)
+
+    A_vals = np.linspace(A_lo, A_hi, n_grid)
+    omega_vals = np.linspace(omega_lo, omega_hi, n_grid)
+    safe_grid = np.zeros((n_grid, n_grid), dtype=float)
+
+    seed_seq = np.random.SeedSequence(seed)
+    child_seeds = seed_seq.spawn(n_grid * n_grid)
+
+    idx = 0
+    for j, A_val in enumerate(A_vals):
+        for i, omega_val in enumerate(omega_vals):
+            cell_seed = int(child_seeds[idx].generate_state(1)[0])
+            idx += 1
+
+            X = sample_X_shake_pulse(
+                n_samples=n_per_cell,
+                A_config=DistributionConfig(kind="uniform", bounds=(A_val, A_val)),
+                omega_config=DistributionConfig(kind="uniform", bounds=(omega_val, omega_val)),
+                sigma_range=sigma_pair,
+                correlation=correlation,
+                t0=t0,
+                q=q,
+                a0=a0,
+                seed=cell_seed,
+            )
+            traj = simulate_cartesian_pendulum_custom(
+                params=params,
+                t_final=t_final,
+                dt=dt,
+                X=X,
+                pivot_eval=pivot_eval,
+                n0=n0,
+                rel_v0=rel_v0,
+                project_each_step=project_each_step,
+            )
+            safe_mask = check_cartesian_safety(traj, threshold=threshold, window=window)
+            safe_grid[j, i] = float(np.mean(safe_mask))
+
+    threshold_value = 1.0 - float(eta)
+    config_safe_grid = (safe_grid >= threshold_value).astype(float)
+
+    return {
+        "A": A_vals,
+        "omega": omega_vals,
+        "mu1": A_vals,
+        "mu2": omega_vals,
+        "box_limits": ((A_lo, A_hi), (omega_lo, omega_hi)),
+        "safe": safe_grid,
+        "p_safe_grid": safe_grid,
+        "config_safe_grid": config_safe_grid,
+        "threshold": threshold_value,
+        "eta": float(eta),
+        "window": window,
+        "theta_threshold_deg": float(threshold),
+        "sigma_range": sigma_pair,
+        "n_per_cell": int(n_per_cell),
+    }
+
+
 def trajectory_theta_deg(traj: dict[str, np.ndarray]) -> np.ndarray:
     """Return bob angle from vertical in degrees for each trajectory and time step."""
 
@@ -364,7 +662,10 @@ def cartesian_stability_labels(
 
 __all__ = [
     "CartesianPendulumParams",
+    "DistributionConfig",
     "cartesian_stability_labels",
+    "compute_cartesian_x_safety_map",
+    "compute_cartesian_mu_safety_map",
     "check_cartesian_safety",
     "check_cartesian_violation",
     "pivot_shake_pulse_batch",
