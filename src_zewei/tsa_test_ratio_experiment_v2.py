@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib.util
 import math
 import pickle
 import random
@@ -30,7 +31,21 @@ if str(SRC) not in sys.path:
 from train.eval import encode_to_latent
 from train.losses import energy_distance_unif, mmd2_unif
 from train.models import EncoderOnly, build_cond_gru_model
-from train.training import eval_epoch, train_epoch, train_epoch_mmd_only
+
+TRAINING_CLEAN_FILE = ROOT / "physics_informed_testing-main" / "share_code" / "src" / "train" / "training_clean.py"
+_training_clean_spec = importlib.util.spec_from_file_location("tsa_training_clean", TRAINING_CLEAN_FILE)
+if _training_clean_spec is None or _training_clean_spec.loader is None:
+    raise ImportError(f"Could not load training_clean.py from {TRAINING_CLEAN_FILE}")
+_training_clean = importlib.util.module_from_spec(_training_clean_spec)
+sys.modules[_training_clean_spec.name] = _training_clean
+_training_clean_spec.loader.exec_module(_training_clean)
+
+DivergenceConfig = _training_clean.DivergenceConfig
+StabilityConfig = _training_clean.StabilityConfig
+TrainingConfig = _training_clean.TrainingConfig
+eval_epoch = _training_clean.eval_epoch
+train_epoch = _training_clean.train_epoch
+train_epoch_mmd_only = _training_clean.train_epoch_mmd_only
 
 
 DEFAULT_RATIOS = (
@@ -40,13 +55,9 @@ DEFAULT_RATIOS = (
     (0.94, 0.06),
     (0.92, 0.08),
     (0.90, 0.10),
-    (0.85, 0.15),
     (0.80, 0.20),
-    (0.75, 0.25),
     (0.70, 0.30),
-    (0.65, 0.35),
     (0.60, 0.40),
-    (0.55, 0.45),
     (0.50, 0.50)
 )
 
@@ -54,7 +65,7 @@ TEST_RATIOS = DEFAULT_RATIOS + ((0.0, 1.0),)
 
 TABLE_SETTINGS = (
     ("null", 1.00, 0.00),
-    ("transition", 0.50, 0.50),
+    ("transition", 0.80, 0.20),
 )
 
 
@@ -82,6 +93,7 @@ class ExperimentConfig:
     weight_decay: float
     lambda_mmd: float
     lambda_stability: float
+    asym_recon_delta: float
     d_v: int
     d_h: int
     hidden_enc: int
@@ -427,18 +439,33 @@ def normalize_with_train_stats(split_data: dict[str, np.ndarray]) -> dict[str, n
     return out
 
 
+# def infer_stability_threshold_from_pairs(o_next: np.ndarray, y: np.ndarray) -> float:
+#     peaks = np.max(np.abs(o_next), axis=(1, 2))
+#     candidates = np.quantile(peaks, np.linspace(0.01, 0.99, 199))
+#     best_threshold = float(np.median(peaks))
+#     best_acc = -1.0
+#     for threshold in candidates:
+#         preds = (peaks <= threshold).astype(np.float32)
+#         acc = float(np.mean(preds == y))
+#         if acc > best_acc:
+#             best_acc = acc
+#             best_threshold = float(threshold)
+#     return best_threshold
+
 def infer_stability_threshold_from_pairs(o_next: np.ndarray, y: np.ndarray) -> float:
+    """
+    Infer a stability threshold from trajectory pairs using a label-free quantile rule.
+
+    Args:
+        o_next: np.ndarray of shape (N, T, D)
+        y: unused (kept for signature compatibility)
+
+    Returns:
+        threshold: float
+    """
     peaks = np.max(np.abs(o_next), axis=(1, 2))
-    candidates = np.quantile(peaks, np.linspace(0.01, 0.99, 199))
-    best_threshold = float(np.median(peaks))
-    best_acc = -1.0
-    for threshold in candidates:
-        preds = (peaks <= threshold).astype(np.float32)
-        acc = float(np.mean(preds == y))
-        if acc > best_acc:
-            best_acc = acc
-            best_threshold = float(threshold)
-    return best_threshold
+    threshold = float(np.quantile(peaks, 0.9))  # 90th percentile
+    return threshold
 
 
 def make_loader(dataset: Dataset, batch_size: int, shuffle: bool, device: torch.device) -> DataLoader:
@@ -475,7 +502,7 @@ def resolve_fixed_train_counts(
     return stable_total, unstable_total, n_train_stable, n_train_unstable
 
 
-def compute_confidence_intervals(k: int, n: int, z: float = 1.96):
+def compute_confidence_intervals(k: int, n: int, z: float = 1.645):
     """
     Returns:
         p_hat,
@@ -710,6 +737,22 @@ def train_mixed_piht(
     device: torch.device,
     stability_threshold: float,
 ) -> tuple[torch.nn.Module, dict[str, float]]:
+    divergence_cfg = DivergenceConfig(
+        lambda_mmd=cfg.lambda_mmd,
+        kwargs={"sigmas": None, "low_discrepancy": True},
+    )
+    stability_cfg = StabilityConfig(
+        lambda_stability=0.0,
+        threshold=stability_threshold,
+        window=None,
+        dt=1.0,
+        t0=0.0,
+        smooth_beta=10.0,
+        loss_type="stability_asymmetric_recon",
+        asym_recon_delta=cfg.asym_recon_delta,
+    )
+    training_cfg = TrainingConfig(divergence=divergence_cfg, stability=stability_cfg)
+
     model = build_cond_gru_model(
         d_x=d_x,
         d_o=d_o,
@@ -731,32 +774,14 @@ def train_mixed_piht(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
-            lambda_mmd=cfg.lambda_mmd,
             device=device,
-            divergence_kwargs={"sigmas": None, "low_discrepancy": True},
-            lambda_stability=0.0,
-            stability_spec={
-                "threshold": stability_threshold,
-                "window": None,
-                "dt": 1.0,
-                "t0": 0.0,
-                "smooth_beta": 10.0,
-            },
-            stability_loss_type="weighted",
+            config=training_cfg,
         )
         val_rec, val_mmd = eval_epoch(
             loader=eval_loader,
             model=model,
             device=device,
-            divergence_kwargs={"sigmas": None, "low_discrepancy": True},
-            lambda_stability=0.0,
-            stability_spec={
-                "threshold": stability_threshold,
-                "window": None,
-                "dt": 1.0,
-                "t0": 0.0,
-                "smooth_beta": 10.0,
-            },
+            config=training_cfg,
         )
         total_metric = float(val_rec + cfg.lambda_mmd * val_mmd)
         if total_metric < best_metric:
@@ -770,15 +795,7 @@ def train_mixed_piht(
         loader=eval_loader,
         model=model,
         device=device,
-        divergence_kwargs={"sigmas": None, "low_discrepancy": True},
-        lambda_stability=0.0,
-        stability_spec={
-            "threshold": stability_threshold,
-            "window": None,
-            "dt": 1.0,
-            "t0": 0.0,
-            "smooth_beta": 10.0,
-        },
+        config=training_cfg,
     )
     return model, {
         "eval_recon": float(rec),
@@ -792,6 +809,10 @@ def train_mmd_baseline(
     cfg: ExperimentConfig,
     device: torch.device,
 ) -> torch.nn.Module:
+    divergence_cfg = DivergenceConfig(
+        lambda_mmd=cfg.lambda_mmd,
+        kwargs={"sigmas": None, "low_discrepancy": True},
+    )
     model = build_cond_gru_model(
         d_x=d_x,
         d_o=50,
@@ -812,9 +833,8 @@ def train_mmd_baseline(
             model_enc=model_enc,
             loader=train_loader,
             optimizer=optimizer,
-            lambda_mmd=cfg.lambda_mmd,
             device=device,
-            divergence_kwargs={"sigmas": None, "low_discrepancy": True},
+            divergence=divergence_cfg,
         )
     return model_enc
 
@@ -827,6 +847,13 @@ def train_trajectory_only(
     cfg: ExperimentConfig,
     device: torch.device,
 ) -> tuple[torch.nn.Module, dict[str, float]]:
+    training_cfg = TrainingConfig(
+        divergence=DivergenceConfig(
+            lambda_mmd=0.0,
+            kwargs={"sigmas": None, "low_discrepancy": True},
+        ),
+        stability=StabilityConfig(lambda_stability=0.0),
+    )
     model = build_cond_gru_model(
         d_x=d_x,
         d_o=d_o,
@@ -848,17 +875,14 @@ def train_trajectory_only(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
-            lambda_mmd=0.0,
             device=device,
-            divergence_kwargs={"sigmas": None, "low_discrepancy": True},
-            lambda_stability=0.0,
+            config=training_cfg,
         )
         val_rec, val_mmd = eval_epoch(
             loader=eval_loader,
             model=model,
             device=device,
-            divergence_kwargs={"sigmas": None, "low_discrepancy": True},
-            lambda_stability=0.0,
+            config=training_cfg,
         )
         total_metric = float(val_rec)
         if total_metric < best_metric:
@@ -872,8 +896,7 @@ def train_trajectory_only(
         loader=eval_loader,
         model=model,
         device=device,
-        divergence_kwargs={"sigmas": None, "low_discrepancy": True},
-        lambda_stability=0.0,
+        config=training_cfg,
     )
     return model, {
         "eval_recon": float(rec),
@@ -1252,15 +1275,16 @@ def parse_args() -> ExperimentConfig:
     parser.add_argument("--epochs-piht", type=int, default=15)
     parser.add_argument("--epochs-mmd", type=int, default=15)
     parser.add_argument("--epochs-bce", type=int, default=20)
-    parser.add_argument("--alpha", type=float, default=0.05)
+    parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--num-repeats", type=int, default=200)
     parser.add_argument("--include-bce", action="store_true")
     parser.add_argument("--lr-piht", type=float, default=5e-3)
     parser.add_argument("--lr-mmd", type=float, default=5e-3)
     parser.add_argument("--lr-bce", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--lambda-mmd", type=float, default=1e-1)
+    parser.add_argument("--lambda-mmd", type=float, default=1)
     parser.add_argument("--lambda-stability", type=float, default=1e-1)
+    parser.add_argument("--asym-recon-delta", type=float, default=3.0)
     parser.add_argument("--d-v", type=int, default=1)
     parser.add_argument("--d-h", type=int, default=64)
     parser.add_argument("--hidden-enc", type=int, default=128)
@@ -1290,6 +1314,7 @@ def parse_args() -> ExperimentConfig:
         weight_decay=args.weight_decay,
         lambda_mmd=args.lambda_mmd,
         lambda_stability=args.lambda_stability,
+        asym_recon_delta=args.asym_recon_delta,
         d_v=args.d_v,
         d_h=args.d_h,
         hidden_enc=args.hidden_enc,
