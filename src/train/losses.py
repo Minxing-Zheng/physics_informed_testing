@@ -30,6 +30,35 @@ def _median_heuristic_sigma(x: torch.Tensor) -> float:
         return med.item() if torch.isfinite(med) else 0.5
 
 
+def _mmd2_to_reference(
+    v: torch.Tensor,
+    ref: torch.Tensor,
+    *,
+    sigmas=None,
+    use_median: bool = True,
+) -> torch.Tensor:
+    """Unbiased MMD^2 between encoder samples ``v`` and a fixed reference sample."""
+    if v.shape != ref.shape:
+        raise ValueError(f"Expected v/ref shape match, got {tuple(v.shape)} vs {tuple(ref.shape)}")
+
+    if sigmas is None:
+        med = _median_heuristic_sigma(torch.cat([v, ref], dim=0)) if use_median else 0.5
+        sigmas = (0.5 * med + 1e-3, med + 1e-3, 2 * med + 1e-3, 4 * med + 1e-3)
+
+    kvv = _rbf_kernel(v, v, sigmas=sigmas)
+    krr = _rbf_kernel(ref, ref, sigmas=sigmas)
+    kvr = _rbf_kernel(v, ref, sigmas=sigmas)
+
+    bsz = v.shape[0]
+    if bsz < 2:
+        return torch.zeros((), device=v.device, dtype=v.dtype)
+
+    kvv = kvv - torch.diag(torch.diagonal(kvv))
+    krr = krr - torch.diag(torch.diagonal(krr))
+
+    return kvv.sum() / (bsz * (bsz - 1)) + krr.sum() / (bsz * (bsz - 1)) - 2.0 * kvr.mean()
+
+
 def mmd2_unif(
     v: torch.Tensor,
     sigmas=None,
@@ -62,16 +91,30 @@ def mmd2_unif(
             u = torch.rand_like(v)
     else:
         u = ref_u
+    return _mmd2_to_reference(v, u, sigmas=sigmas, use_median=use_median)
 
-    kvv = _rbf_kernel(v, v, sigmas=sigmas)
-    kuu = _rbf_kernel(u, u, sigmas=sigmas)
-    kvu = _rbf_kernel(v, u, sigmas=sigmas)
 
-    bsz = v.shape[0]
-    kvv = kvv - torch.diag(torch.diagonal(kvv))
-    kuu = kuu - torch.diag(torch.diagonal(kuu))
+def mmd2_beta(
+    v: torch.Tensor,
+    alpha: float = 5.0,
+    beta: float = 5.0,
+    sigmas=None,
+    ref_beta: torch.Tensor | None = None,
+    use_median: bool = True,
+) -> torch.Tensor:
+    """Unbiased MMD^2 between encoder samples ``v`` and iid Beta(alpha, beta) reference."""
+    if float(alpha) <= 0 or float(beta) <= 0:
+        raise ValueError(f"alpha and beta must be positive, got alpha={alpha}, beta={beta}")
 
-    return kvv.sum() / (bsz * (bsz - 1)) + kuu.sum() / (bsz * (bsz - 1)) - 2.0 * kvu.mean()
+    if ref_beta is None:
+        conc1 = torch.as_tensor(float(alpha), device=v.device, dtype=v.dtype)
+        conc0 = torch.as_tensor(float(beta), device=v.device, dtype=v.dtype)
+        dist = torch.distributions.Beta(conc1, conc0)
+        ref = dist.sample(v.shape)
+    else:
+        ref = ref_beta.to(device=v.device, dtype=v.dtype)
+
+    return _mmd2_to_reference(v, ref, sigmas=sigmas, use_median=use_median)
 
 
 def energy_distance_unif(v: torch.Tensor, ref_u: torch.Tensor | None = None) -> torch.Tensor:

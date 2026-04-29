@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from train.losses import mmd2_unif
+from train.losses import mmd2_beta, mmd2_unif
 
 
 def _unpack_seq_batch(batch):
@@ -222,6 +222,102 @@ def _regime_hinge_loss(
     return is_safe_regime * safe_loss + (1.0 - is_safe_regime) * unsafe_loss
 
 
+def _safe_uniform_unsafe_center_loss(
+    v: torch.Tensor,
+    y_safe: torch.Tensor,
+    *,
+    divergence_fn: Callable[[torch.Tensor], torch.Tensor],
+    divergence_kwargs: Optional[Dict] = None,
+    unsafe_center: float = 0.5,
+    unsafe_center_weight: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Shape the latent by class:
+      - safe points (y=1) are pushed toward the reference distribution via divergence_fn
+      - unsafe points (y=0) are pushed toward a center value
+
+    Returns (total_latent_loss, safe_divergence, unsafe_center_loss).
+    """
+    if divergence_kwargs is None:
+        divergence_kwargs = {}
+    if y_safe.ndim != 1:
+        raise ValueError(f"y_safe must be 1D, got shape {tuple(y_safe.shape)}")
+    if v.shape[0] != y_safe.shape[0]:
+        raise ValueError(f"v/y_safe batch mismatch: {tuple(v.shape)} vs {tuple(y_safe.shape)}")
+    if float(unsafe_center_weight) < 0:
+        raise ValueError("unsafe_center_weight must be non-negative")
+
+    safe_mask = y_safe >= 0.5
+    unsafe_mask = ~safe_mask
+
+    safe_div = torch.zeros((), device=v.device, dtype=v.dtype)
+    if torch.sum(safe_mask) >= 2:
+        safe_div = divergence_fn(v[safe_mask], **divergence_kwargs)
+
+    unsafe_center_loss = torch.zeros((), device=v.device, dtype=v.dtype)
+    if torch.any(unsafe_mask):
+        target = torch.full_like(v[unsafe_mask], float(unsafe_center))
+        unsafe_center_loss = F.mse_loss(v[unsafe_mask], target, reduction="mean")
+
+    total = safe_div + float(unsafe_center_weight) * unsafe_center_loss
+    return total, safe_div, unsafe_center_loss
+
+
+def _safe_uniform_unsafe_beta_loss(
+    v: torch.Tensor,
+    y_safe: torch.Tensor,
+    *,
+    divergence_fn: Callable[[torch.Tensor], torch.Tensor],
+    divergence_kwargs: Optional[Dict] = None,
+    unsafe_beta_alpha: float = 5.0,
+    unsafe_beta_beta: float = 5.0,
+    unsafe_beta_weight: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Shape the latent by class:
+      - safe points (y=1) are pushed toward the reference distribution via divergence_fn
+      - unsafe points (y=0) are pushed toward Beta(alpha, beta) on (0, 1)
+
+    Returns (total_latent_loss, safe_divergence, unsafe_beta_loss).
+    """
+    if divergence_kwargs is None:
+        divergence_kwargs = {}
+    if y_safe.ndim != 1:
+        raise ValueError(f"y_safe must be 1D, got shape {tuple(y_safe.shape)}")
+    if v.shape[0] != y_safe.shape[0]:
+        raise ValueError(f"v/y_safe batch mismatch: {tuple(v.shape)} vs {tuple(y_safe.shape)}")
+    if float(unsafe_beta_alpha) <= 0 or float(unsafe_beta_beta) <= 0:
+        raise ValueError(
+            "unsafe_beta_alpha and unsafe_beta_beta must be positive"
+        )
+    if float(unsafe_beta_weight) < 0:
+        raise ValueError("unsafe_beta_weight must be non-negative")
+
+    safe_mask = y_safe >= 0.5
+    unsafe_mask = ~safe_mask
+
+    safe_div = torch.zeros((), device=v.device, dtype=v.dtype)
+    if torch.sum(safe_mask) >= 2:
+        safe_div = divergence_fn(v[safe_mask], **divergence_kwargs)
+
+    unsafe_beta_loss = torch.zeros((), device=v.device, dtype=v.dtype)
+    if torch.sum(unsafe_mask) >= 2:
+        beta_kwargs = {}
+        if "sigmas" in divergence_kwargs:
+            beta_kwargs["sigmas"] = divergence_kwargs["sigmas"]
+        if "use_median" in divergence_kwargs:
+            beta_kwargs["use_median"] = divergence_kwargs["use_median"]
+        unsafe_beta_loss = mmd2_beta(
+            v[unsafe_mask],
+            alpha=float(unsafe_beta_alpha),
+            beta=float(unsafe_beta_beta),
+            **beta_kwargs,
+        )
+
+    total = safe_div + float(unsafe_beta_weight) * unsafe_beta_loss
+    return total, safe_div, unsafe_beta_loss
+
+
 def train_epoch(
     model: torch.nn.Module,
     loader,
@@ -243,12 +339,28 @@ def train_epoch(
     regime_gamma: float = 0.9,
     regime_delta_safe: float = 0.05,
     regime_delta_unsafe: float = 0.2,
+    latent_target_mode: Optional[str] = None,
+    unsafe_center: float = 0.5,
+    unsafe_center_weight: float = 1.0,
+    unsafe_beta_alpha: float = 5.0,
+    unsafe_beta_beta: float = 5.0,
+    unsafe_beta_weight: float = 1.0,
 ) -> float:
     """
     Train conditional model for one epoch with a configurable divergence.
     """
     if divergence_kwargs is None:
         divergence_kwargs = {}
+    latent_target_mode_eff = None if latent_target_mode is None else str(latent_target_mode).lower()
+    if latent_target_mode_eff not in {
+        None,
+        "safe_uniform_unsafe_center",
+        "safe_uniform_unsafe_beta",
+    }:
+        raise ValueError(
+            f"Unsupported latent_target_mode='{latent_target_mode}'. "
+            "Use None, 'safe_uniform_unsafe_center', or 'safe_uniform_unsafe_beta'."
+        )
     loss_mode = str(stability_loss_type).lower()
     if loss_mode not in {"bce", "weighted", "weighted_bce"}:
         raise ValueError(
@@ -296,6 +408,7 @@ def train_epoch(
 
         o_hat, v = model(x, o_hist_b)
         mmd = divergence_fn(v, **divergence_kwargs)
+        latent_reg = mmd
         logits_safe = None
         if loss_mode == "weighted" or lambda_stability_eff != 0.0:
             if y_b is None:
@@ -320,6 +433,35 @@ def train_epoch(
                 raise ValueError(
                     f"stability logits and y shape mismatch: {tuple(logits_safe.shape)} vs {tuple(y_b.shape)}"
                 )
+        if latent_target_mode_eff == "safe_uniform_unsafe_center":
+            if y_b is None:
+                raise ValueError(
+                    "latent_target_mode='safe_uniform_unsafe_center' requires y labels "
+                    "in loader batch (dataset should return 4th element y)."
+                )
+            latent_reg, _, _ = _safe_uniform_unsafe_center_loss(
+                v=v,
+                y_safe=y_b,
+                divergence_fn=divergence_fn,
+                divergence_kwargs=divergence_kwargs,
+                unsafe_center=float(unsafe_center),
+                unsafe_center_weight=float(unsafe_center_weight),
+            )
+        elif latent_target_mode_eff == "safe_uniform_unsafe_beta":
+            if y_b is None:
+                raise ValueError(
+                    "latent_target_mode='safe_uniform_unsafe_beta' requires y labels "
+                    "in loader batch (dataset should return 4th element y)."
+                )
+            latent_reg, _, _ = _safe_uniform_unsafe_beta_loss(
+                v=v,
+                y_safe=y_b,
+                divergence_fn=divergence_fn,
+                divergence_kwargs=divergence_kwargs,
+                unsafe_beta_alpha=float(unsafe_beta_alpha),
+                unsafe_beta_beta=float(unsafe_beta_beta),
+                unsafe_beta_weight=float(unsafe_beta_weight),
+            )
 
         if loss_mode == "weighted":
             # Eq-style per-sample reconstruction weighting by stability misclassification.
@@ -333,7 +475,7 @@ def train_epoch(
         else:
             rec = F.mse_loss(o_hat, o_next_b)
 
-        loss = rec + lambda_mmd * mmd
+        loss = rec + lambda_mmd * latent_reg
 
         if lambda_stability_eff != 0.0:
             stability_loss = _stability_loss(
@@ -420,9 +562,25 @@ def eval_epoch(
     stability_smooth_beta: float = 10.0,
     stability_spec: Optional[Dict[str, Any]] = None,
     return_stability: bool = False,
+    latent_target_mode: Optional[str] = None,
+    unsafe_center: float = 0.5,
+    unsafe_center_weight: float = 1.0,
+    unsafe_beta_alpha: float = 5.0,
+    unsafe_beta_beta: float = 5.0,
+    unsafe_beta_weight: float = 1.0,
 ) -> Tuple[float, float] | Tuple[float, float, Optional[float]]:
     if divergence_kwargs is None:
         divergence_kwargs = {}
+    latent_target_mode_eff = None if latent_target_mode is None else str(latent_target_mode).lower()
+    if latent_target_mode_eff not in {
+        None,
+        "safe_uniform_unsafe_center",
+        "safe_uniform_unsafe_beta",
+    }:
+        raise ValueError(
+            f"Unsupported latent_target_mode='{latent_target_mode}'. "
+            "Use None, 'safe_uniform_unsafe_center', or 'safe_uniform_unsafe_beta'."
+        )
     (
         lambda_stability_eff,
         stability_threshold_eff,
@@ -453,7 +611,39 @@ def eval_epoch(
 
         o_hat, v = model(x, o_hist_b)
         rec = F.mse_loss(o_hat, o_next_b, reduction="mean").item()
-        mmd = divergence_fn(v, **divergence_kwargs).item()
+        if latent_target_mode_eff == "safe_uniform_unsafe_center":
+            if y_b is None:
+                raise ValueError(
+                    "latent_target_mode='safe_uniform_unsafe_center' requires y labels "
+                    "in loader batch (dataset should return 4th element y)."
+                )
+            latent_reg, _, _ = _safe_uniform_unsafe_center_loss(
+                v=v,
+                y_safe=y_b,
+                divergence_fn=divergence_fn,
+                divergence_kwargs=divergence_kwargs,
+                unsafe_center=float(unsafe_center),
+                unsafe_center_weight=float(unsafe_center_weight),
+            )
+            mmd = float(latent_reg.item())
+        elif latent_target_mode_eff == "safe_uniform_unsafe_beta":
+            if y_b is None:
+                raise ValueError(
+                    "latent_target_mode='safe_uniform_unsafe_beta' requires y labels "
+                    "in loader batch (dataset should return 4th element y)."
+                )
+            latent_reg, _, _ = _safe_uniform_unsafe_beta_loss(
+                v=v,
+                y_safe=y_b,
+                divergence_fn=divergence_fn,
+                divergence_kwargs=divergence_kwargs,
+                unsafe_beta_alpha=float(unsafe_beta_alpha),
+                unsafe_beta_beta=float(unsafe_beta_beta),
+                unsafe_beta_weight=float(unsafe_beta_weight),
+            )
+            mmd = float(latent_reg.item())
+        else:
+            mmd = divergence_fn(v, **divergence_kwargs).item()
         stability_val = None
         if lambda_stability_eff != 0.0:
             if y_b is None:
@@ -728,6 +918,12 @@ def train_eval_epoch(
     regime_delta_safe: float = 0.05,
     regime_delta_unsafe: float = 0.2,
     return_val_stability: bool = False,
+    latent_target_mode: Optional[str] = None,
+    unsafe_center: float = 0.5,
+    unsafe_center_weight: float = 1.0,
+    unsafe_beta_alpha: float = 5.0,
+    unsafe_beta_beta: float = 5.0,
+    unsafe_beta_weight: float = 1.0,
 ) -> Tuple[float, Optional[float], Optional[float]] | Tuple[float, Optional[float], Optional[float], Optional[float]]:
     """
     Run one train epoch and optionally evaluate on val_loader.
@@ -754,6 +950,12 @@ def train_eval_epoch(
         regime_gamma=regime_gamma,
         regime_delta_safe=regime_delta_safe,
         regime_delta_unsafe=regime_delta_unsafe,
+        latent_target_mode=latent_target_mode,
+        unsafe_center=unsafe_center,
+        unsafe_center_weight=unsafe_center_weight,
+        unsafe_beta_alpha=unsafe_beta_alpha,
+        unsafe_beta_beta=unsafe_beta_beta,
+        unsafe_beta_weight=unsafe_beta_weight,
     )
     if val_loader is None:
         if return_val_stability:
@@ -773,12 +975,116 @@ def train_eval_epoch(
         stability_smooth_beta=stability_smooth_beta,
         stability_spec=stability_spec,
         return_stability=return_val_stability,
+        latent_target_mode=latent_target_mode,
+        unsafe_center=unsafe_center,
+        unsafe_center_weight=unsafe_center_weight,
+        unsafe_beta_alpha=unsafe_beta_alpha,
+        unsafe_beta_beta=unsafe_beta_beta,
+        unsafe_beta_weight=unsafe_beta_weight,
     )
     if return_val_stability:
         va_rec, va_mmd, va_stability = va_out  # type: ignore[misc]
         return tr_loss, va_rec, va_mmd, va_stability
 
     va_rec, va_mmd = va_out  # type: ignore[misc]
+    return tr_loss, va_rec, va_mmd
+
+
+def train_eval_epoch_stability(
+    model: torch.nn.Module,
+    train_loader,
+    optimizer: torch.optim.Optimizer,
+    lambda_mmd: float,
+    device: torch.device,
+    val_loader=None,
+    divergence_fn: Callable[[torch.Tensor], torch.Tensor] = mmd2_unif,
+    divergence_kwargs: Optional[Dict] = None,
+    stability_threshold: Optional[float] = None,
+    stability_spec: Optional[Dict[str, Any]] = None,
+    asym_recon_delta: float = 2.0,
+) -> Tuple[float, Optional[float], Optional[float]]:
+    """
+    Train one epoch with asymmetric stability-weighted reconstruction:
+      loss = weighted_recon + lambda_mmd * divergence
+
+    Weighted reconstruction follows the same rule as
+    ``stability_asymmetric_recon`` in ``training_clean.py``:
+      - build elementwise squared error
+      - upweight entries where |target| > threshold and prediction moves
+        in the wrong direction, by factor ``asym_recon_delta``.
+    """
+    if divergence_kwargs is None:
+        divergence_kwargs = {}
+    if float(asym_recon_delta) < 1.0:
+        raise ValueError("asym_recon_delta must be at least 1.0")
+
+    (
+        _,
+        stability_threshold_eff,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+    ) = _resolve_stability_cfg(
+        lambda_stability=0.0,
+        stability_threshold=stability_threshold,
+        stability_window=None,
+        stability_dt=1.0,
+        stability_t0=0.0,
+        stability_spec=stability_spec,
+        stability_smooth_beta=10.0,
+    )
+    if stability_threshold_eff is None:
+        raise ValueError(
+            "stability_threshold must be provided (directly or via stability_spec) "
+            "for train_eval_epoch_stability."
+        )
+
+    model.train()
+    total_loss, n = 0.0, 0
+    for batch in train_loader:
+        x, o_hist_b, o_next_b, _ = _unpack_seq_batch(batch)
+        x = x.to(device)
+        o_hist_b = o_hist_b.to(device)
+        o_next_b = o_next_b.to(device)
+
+        o_hat, v = model(x, o_hist_b)
+        mmd = divergence_fn(v, **divergence_kwargs)
+
+        sq_err = (o_hat - o_next_b) ** 2
+        unstable = torch.abs(o_next_b) > float(stability_threshold_eff)
+        wrong_direction = torch.sign(o_next_b) * o_hat < torch.sign(o_next_b) * o_next_b
+        rec_weights = torch.where(
+            unstable & wrong_direction,
+            torch.full_like(o_next_b, float(asym_recon_delta)),
+            torch.ones_like(o_next_b),
+        )
+        rec = torch.mean(rec_weights * sq_err)
+
+        loss = rec + float(lambda_mmd) * mmd
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        bs = x.shape[0]
+        total_loss += float(loss.item()) * bs
+        n += bs
+
+    tr_loss = total_loss / n
+
+    if val_loader is None:
+        return tr_loss, None, None
+
+    va_rec, va_mmd = eval_epoch(
+        loader=val_loader,
+        model=model,
+        device=device,
+        divergence_fn=divergence_fn,
+        divergence_kwargs=divergence_kwargs,
+    )
     return tr_loss, va_rec, va_mmd
 
 

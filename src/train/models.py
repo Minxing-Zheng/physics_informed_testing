@@ -8,6 +8,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def _build_mlp(
@@ -112,6 +113,111 @@ class RNNBackbone(nn.Module):
         return self.rnn(x)
 
 
+class SpectralConv1d(nn.Module):
+    """
+    1D spectral convolution used in Fourier neural operator style blocks.
+
+    Input/Output shape: (B, C, L)
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, n_modes: int) -> None:
+        super().__init__()
+        if n_modes < 1:
+            raise ValueError("n_modes must be >= 1")
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.n_modes = int(n_modes)
+
+        scale = 1.0 / max(1, in_channels * out_channels)
+        self.weight = nn.Parameter(
+            scale * torch.randn(in_channels, out_channels, self.n_modes, dtype=torch.cfloat)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"expected x with shape (B, C, L), got {tuple(x.shape)}")
+        bsz, _, seq_len = x.shape
+        x_ft = torch.fft.rfft(x, dim=-1)
+        n_freq = x_ft.shape[-1]
+        n_used = min(self.n_modes, n_freq)
+
+        out_ft = torch.zeros(
+            bsz,
+            self.out_channels,
+            n_freq,
+            device=x.device,
+            dtype=torch.cfloat,
+        )
+        out_ft[:, :, :n_used] = torch.einsum(
+            "bcm,com->bom",
+            x_ft[:, :, :n_used],
+            self.weight[:, :, :n_used],
+        )
+        return torch.fft.irfft(out_ft, n=seq_len, dim=-1)
+
+
+class NeuralOperatorBlock1d(nn.Module):
+    """
+    Single operator block mixing global spectral interactions and local channels.
+    """
+
+    def __init__(self, width: int, n_modes: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.spec = SpectralConv1d(width, width, n_modes=n_modes)
+        self.local = nn.Conv1d(width, width, kernel_size=1)
+        self.norm = nn.BatchNorm1d(width)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.spec(x) + self.local(x)
+        y = self.norm(y)
+        y = F.gelu(y)
+        return self.dropout(y)
+
+
+class NeuralOperatorBackbone(nn.Module):
+    """
+    Conditional 1D neural-operator backbone over the time axis.
+
+    Input:  (B, L, d_o + d_v)
+    Output: (B, L, d_h)
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 4,
+        n_modes: int = 16,
+        width: Optional[int] = None,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        width_eff = int(hidden_size if width is None else width)
+        if width_eff < 1:
+            raise ValueError("width must be >= 1")
+        self.input_proj = nn.Linear(input_size, width_eff)
+        self.blocks = nn.ModuleList(
+            [
+                NeuralOperatorBlock1d(width=width_eff, n_modes=n_modes, dropout=dropout)
+                for _ in range(int(num_layers))
+            ]
+        )
+        self.output_proj = nn.Linear(width_eff, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"expected x with shape (B, L, C), got {tuple(x.shape)}")
+        h = self.input_proj(x)  # (B, L, width)
+        h = h.transpose(1, 2)  # (B, width, L)
+        for block in self.blocks:
+            h = h + block(h)  # residual operator update
+        h = h.transpose(1, 2)  # (B, L, width)
+        return self.output_proj(h)  # (B, L, d_h)
+
+
 class CondRNNModel(nn.Module):
     def __init__(self, encoder: nn.Module, rnn: nn.Module, decoder: nn.Module) -> None:
         super().__init__()
@@ -131,6 +237,41 @@ class CondRNNModel(nn.Module):
         inp = torch.cat([o_hist, v_rep], dim=-1)
         h_seq, _ = self.rnn(inp)
         o_hat_next = self.dec(h_seq)
+        return o_hat_next, v
+
+
+class CondNeuralOperatorModel(nn.Module):
+    def __init__(
+        self,
+        encoder: nn.Module,
+        operator: nn.Module,
+        decoder: nn.Module,
+        residual_update: bool = True,
+        residual_dt: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.enc = encoder
+        self.operator = operator
+        self.dec = decoder
+        self.residual_update = bool(residual_update)
+        self.residual_dt = float(residual_dt)
+
+    def forward(self, x: torch.Tensor, o_hist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        x:      (B, d_x)
+        o_hist: (B, L, d_o)
+        returns o_hat_next: (B, L, d_o), v: (B, d_v)
+        """
+        v = self.enc(x)
+        bsz, seq_len, _ = o_hist.shape
+        v_rep = v[:, None, :].expand(bsz, seq_len, v.shape[-1])
+        inp = torch.cat([o_hist, v_rep], dim=-1)
+        h_seq = self.operator(inp)
+        delta_or_out = self.dec(h_seq)
+        if self.residual_update:
+            o_hat_next = o_hist + self.residual_dt * delta_or_out
+        else:
+            o_hat_next = delta_or_out
         return o_hat_next, v
 
 
@@ -169,3 +310,49 @@ def build_cond_gru_model(
     rnn = RNNBackbone(input_size=d_o + d_v, hidden_size=d_h, rnn_type="gru",dropout=dropout_rnn)
     decoder = MLPDecoder(d_h=d_h, d_o=d_o, hidden_size=hidden_dec, num_hidden_layers=dec_layers)
     return CondRNNModel(encoder=encoder, rnn=rnn, decoder=decoder)
+
+
+def build_neural_operator_model(
+    d_x: int = 2,
+    d_o: int = 1,
+    d_v: int = 8,
+    d_h: int = 64,
+    hidden_enc: int = 128,
+    hidden_dec: int = 128,
+    enc_layers: int = 2,
+    dec_layers: int = 1,
+    output_activation: Optional[str] = "sigmoid",
+    operator_layers: int = 4,
+    operator_modes: int = 16,
+    operator_width: Optional[int] = None,
+    dropout_operator: float = 0.0,
+    residual_update: bool = True,
+    residual_dt: float = 1.0,
+) -> CondNeuralOperatorModel:
+    """
+    Build a conditional neural-operator model with the same train/eval API as
+    build_cond_gru_model.
+    """
+    encoder = MLPEncoder(
+        d_x=d_x,
+        d_v=d_v,
+        hidden_size=hidden_enc,
+        num_hidden_layers=enc_layers,
+        output_activation=output_activation,
+    )
+    operator = NeuralOperatorBackbone(
+        input_size=d_o + d_v,
+        hidden_size=d_h,
+        num_layers=operator_layers,
+        n_modes=operator_modes,
+        width=operator_width,
+        dropout=dropout_operator,
+    )
+    decoder = MLPDecoder(d_h=d_h, d_o=d_o, hidden_size=hidden_dec, num_hidden_layers=dec_layers)
+    return CondNeuralOperatorModel(
+        encoder=encoder,
+        operator=operator,
+        decoder=decoder,
+        residual_update=residual_update,
+        residual_dt=residual_dt,
+    )
